@@ -8,6 +8,23 @@ st.set_page_config(page_title="三關價分析看板", layout="wide")
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 
 
+# --- 取得台股代號與名稱對照表 (快取 1 天) ---
+@st.cache_data(ttl=86400)
+def get_stock_info_map() -> dict:
+    try:
+        params = {"dataset": "TaiwanStockInfo"}
+        resp = requests.get(FINMIND_URL, params=params, timeout=10)
+        data = resp.json()
+        if data.get("msg") == "success" and data.get("data"):
+            # 建立 { '2330': '台積電', '2327': '國巨', ... }
+            return {
+                item["stock_id"]: item["stock_name"] for item in data["data"]
+            }
+    except Exception:
+        pass
+    return {}
+
+
 # --- 1. 抓取股票或指數 (大盤 / 櫃買 / 個股) ---
 def fetch_stock_or_index(data_id: str, days: int = 45) -> pd.DataFrame:
     start_date = (datetime.now() - timedelta(days=days * 2)).strftime(
@@ -58,12 +75,10 @@ def fetch_tx_futures(days: int = 45) -> pd.DataFrame:
         raise ValueError("台指期貨資料取得失敗。")
 
     raw_df = pd.DataFrame(data["data"])
-    # 篩選一般日間交易時段 (position) 並排除價差合約
     if "trading_session" in raw_df.columns:
         raw_df = raw_df[raw_df["trading_session"] == "position"]
     raw_df = raw_df[~raw_df["contract_date"].astype(str).str.contains("/")]
 
-    # 依日期與月份排序，每個交易日取近月第一筆
     raw_df.sort_values(by=["date", "contract_date"], inplace=True)
     near_df = raw_df.groupby("date").first().reset_index()
 
@@ -87,9 +102,9 @@ def fetch_tx_futures(days: int = 45) -> pd.DataFrame:
 @st.cache_data(ttl=300)
 def get_stock_three_passes(user_input: str, days: int = 30):
     query = user_input.strip().upper()
+    stock_map = get_stock_info_map()
 
     try:
-        # 分流判斷標的
         if query in ["大盤", "加權", "加權指數", "^TWII", "0000", "TAIEX"]:
             df = fetch_stock_or_index("TAIEX", days=days)
             target_name = "加權指數 (大盤)"
@@ -110,7 +125,13 @@ def get_stock_three_passes(user_input: str, days: int = 30):
         else:
             clean_id = query.replace(".TW", "").replace(".TWO", "")
             df = fetch_stock_or_index(clean_id, days=days)
-            target_name = f"個股 {clean_id}"
+            # 自動帶出股名
+            stock_name = stock_map.get(clean_id, "")
+            target_name = (
+                f"{clean_id} {stock_name}".strip()
+                if stock_name
+                else f"個股 {clean_id}"
+            )
     except Exception as e:
         return None, None, None, f"查詢失敗：{str(e)}"
 
@@ -123,7 +144,7 @@ def get_stock_three_passes(user_input: str, days: int = 30):
     df["漲跌幅(%)"] = (df["漲跌"] / df["昨收"]) * 100
     df["振幅(%)"] = ((df["High"] - df["Low"]) / df["昨收"]) * 100
 
-    # 2. 當日三關價計算
+    # 2. 當日三關價
     prev_high = df["High"].shift(1)
     prev_low = df["Low"].shift(1)
     diff = prev_high - prev_low
@@ -169,7 +190,7 @@ def get_stock_three_passes(user_input: str, days: int = 30):
         "today_note": latest_row["說明"],
     }
 
-    # 5. 格式整理與倒序排列
+    # 5. 格式整理
     rename_map = {
         "Open": "開盤",
         "High": "最高",
@@ -199,10 +220,10 @@ def get_stock_three_passes(user_input: str, days: int = 30):
     return result, next_day_passes, target_name, None
 
 
-# --- 網頁畫面呈現 ---
+# --- 介面呈現 ---
 st.title("三關價分析看板")
 st.caption(
-    "支援輸入：大盤 (加權)、櫃買 (上櫃)、台指期 (近月)、個股代號 (如: 2330 / 8069)"
+    "支援輸入：大盤 (加權)、櫃買 (上櫃)、台指期 (近月)、個股代號 (如: 2330)"
 )
 
 col1, col2 = st.columns([3, 1])
@@ -210,7 +231,7 @@ with col1:
     user_input = st.text_input(
         "請輸入股號或標的名稱",
         value="大盤",
-        help="可輸入：大盤、櫃買、台指期、2330、8069...",
+        help="可輸入：大盤、櫃買、台指期、2330、2327...",
     )
 with col2:
     days_to_show = st.number_input(
@@ -252,7 +273,16 @@ if user_input:
             help="明日多方防守價位",
         )
 
-        st.markdown(f"**最新交易日型態結算：** {next_info['today_note']}")
+        # 根據型態結算自動切換醒目的卡片顏色
+        note_text = next_info["today_note"]
+        if "強勢" in note_text or "漲破" in note_text:
+            st.error(f"🔥 **最新交易日型態結算：{note_text}**")
+        elif "偏多" in note_text:
+            st.warning(f"📈 **最新交易日型態結算：{note_text}**")
+        elif "偏空" in note_text:
+            st.info(f"📉 **最新交易日型態結算：{note_text}**")
+        else:  # 弱勢 / 跌破
+            st.success(f"⚠️ **最新交易日型態結算：{note_text}**")
 
         st.write("### 詳細交易歷史清單")
 
