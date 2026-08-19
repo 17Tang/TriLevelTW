@@ -4,21 +4,19 @@ import requests
 import streamlit as st
 import twstock
 
+# 設定頁面標題與版面寬度
 st.set_page_config(page_title="台股三關價即時分析", layout="wide")
 
 
-# --- 抓取台股指數 (大盤 / 櫃買) ---
-def fetch_index_data(symbol: str) -> pd.DataFrame:
-    """從證交所開放資料抓取加權指數或從 Yahoo 備用 API 抓取歷史"""
-    # 透過證交所 API 取得近期加權指數
+# --- 抓取台股大盤指數 (證交所官方 API) ---
+def fetch_index_data() -> pd.DataFrame:
     url = "https://openapi.twse.com.tw/v1/exchangeReport/FMTQIK"
     resp = requests.get(url, timeout=10)
     data = resp.json()
 
-    # 欄位: 日期, 成交股數, 成交金額, 成交筆數, 發行量加權股價指數, 漲跌點數
     records = []
     for item in data:
-        # 民國轉西元日期 113/05/20 -> 2024-05-20
+        # 民國年轉西元年 (如 113/05/20 -> 2024-05-20)
         d_parts = item["Date"].split("/")
         ad_year = int(d_parts[0]) + 1911
         date_str = f"{ad_year}-{d_parts[1]}-{d_parts[2]}"
@@ -31,26 +29,28 @@ def fetch_index_data(symbol: str) -> pd.DataFrame:
     df.set_index("Date", inplace=True)
     df.sort_index(inplace=True)
 
-    # 由於官方此 API 只提供收盤價，以近似方式提供三關價參考
+    # 指數日報 API 僅回傳收盤價，以近似開高低供三關價計算
     df["Open"] = df["Close"]
     df["High"] = df["Close"]
     df["Low"] = df["Close"]
     return df
 
 
-# --- 抓取上市/上櫃個股資料 ---
+# --- 抓取上市/上櫃個股日 K 線資料 (twstock) ---
 def fetch_stock_data(stock_id: str) -> pd.DataFrame:
     stock = twstock.Stock(stock_id)
-    # 抓取最近 70 筆日資料 (約 3 個月)
-    data = stock.fetch_31()  # 當月與前一個月
-    # 如果資料太少，額外抓取更早之前的資料
+
+    # 抓取最近約 3 個月資料以確保有 30 個完整交易日
     today = datetime.now()
     all_data = []
     for i in range(3):
         m_date = today - timedelta(days=i * 28)
         all_data.extend(stock.fetch(m_date.year, m_date.month))
 
-    # 去除重複交易日
+    if not all_data:
+        raise ValueError("查無此股票代號或無交易數據")
+
+    # 去除跨月可能出現的重複資料
     unique_dict = {d.date: d for d in all_data}
     sorted_data = sorted(unique_dict.values(), key=lambda x: x.date)
 
@@ -77,30 +77,29 @@ def fetch_stock_data(stock_id: str) -> pd.DataFrame:
 def get_stock_three_passes(stock_id: str, days: int = 30):
     stock_id = stock_id.strip().upper()
 
-    # 1. 抓取資料
     try:
-        if stock_id in ["^TWII", "0000", "加權", "大盤"]:
-            df = fetch_index_data("大盤")
+        if stock_id in ["^TWII", "0000", "加權", "大盤", "TWA00"]:
+            df = fetch_index_data()
         else:
-            # 清除可能帶有的 .TW / .TWO 後綴
+            # 清除可能誤帶的後綴 (.TW / .TWO)
             clean_id = stock_id.replace(".TW", "").replace(".TWO", "")
             df = fetch_stock_data(clean_id)
     except Exception as e:
         return (
             None,
-            f"資料抓取失敗，請確認代號是否正確 (錯誤訊息: {str(e)})",
+            f"資料抓取失敗，請確認代號是否正確 (錯誤資訊: {str(e)})",
         )
 
     if df.empty or len(df) < 2:
-        return None, "查無交易數據或交易日過少。"
+        return None, "查無交易數據或交易日不足。"
 
-    # 2. 昨收、漲跌、漲跌幅、振幅計算
+    # 1. 昨收、漲跌、漲跌幅、振幅計算
     df["昨收"] = df["Close"].shift(1)
     df["漲跌"] = df["Close"] - df["昨收"]
     df["漲跌幅(%)"] = (df["漲跌"] / df["昨收"]) * 100
     df["振幅(%)"] = ((df["High"] - df["Low"]) / df["昨收"]) * 100
 
-    # 3. 三關價計算
+    # 2. 三關價計算 (昨日高低價計算今日關卡)
     prev_high = df["High"].shift(1)
     prev_low = df["Low"].shift(1)
     diff = prev_high - prev_low
@@ -109,7 +108,7 @@ def get_stock_three_passes(stock_id: str, days: int = 30):
     df["中關(日關)"] = (prev_high + prev_low) / 2
     df["下關(多方防守)"] = prev_low - (diff * 0.382)
 
-    # 4. 說明區間判斷
+    # 3. 說明區間判斷
     def judge_position(row):
         close = row["Close"]
         up = row["上關(空方防守)"]
@@ -129,7 +128,7 @@ def get_stock_three_passes(stock_id: str, days: int = 30):
 
     df["說明"] = df.apply(judge_position, axis=1)
 
-    # 欄位重新命名與格式整理
+    # 4. 欄位整理與重新命名
     rename_map = {
         "Open": "開盤",
         "High": "最高",
@@ -159,9 +158,9 @@ def get_stock_three_passes(stock_id: str, days: int = 30):
     return result, None
 
 
-# --- Streamlit 網頁介面 ---
+# --- 介面呈現 ---
 st.title("📈 台股近 30 日三關價分析看板")
-st.caption("資料來源：TWSE 臺灣證券交易所 / TPEx 櫃買中心")
+st.caption("資料來源：TWSE 臺灣證券交易所 / TPEx 櫃買中心 (免 Yahoo API)")
 
 col1, col2 = st.columns([3, 1])
 with col1:
@@ -172,7 +171,7 @@ with col2:
     )
 
 if user_input:
-    with st.spinner("向證交所連線更新數據中..."):
+    with st.spinner("向證券交易所連線更新數據中..."):
         df_result, err = get_stock_three_passes(user_input, days=days_to_show)
 
     if err:
