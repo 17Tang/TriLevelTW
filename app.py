@@ -12,7 +12,7 @@ HEADERS = {
 }
 
 
-# --- 1. 抓取加權指數 (大盤) 完整開高低收 ---
+# --- 1. 抓取加權指數 (大盤) ---
 def fetch_twse_index(months: int = 3) -> pd.DataFrame:
     records = []
     today = datetime.now()
@@ -24,16 +24,68 @@ def fetch_twse_index(months: int = 3) -> pd.DataFrame:
 
         try:
             resp = requests.get(url, headers=HEADERS, timeout=8)
-            res_json = resp.json()
-            if "data" in res_json:
-                for row in res_json["data"]:
-                    # 日期格式: 民國年/月/日 (如 113/05/20)
-                    parts = row[0].split("/")
-                    ad_year = int(parts[0]) + 1911
-                    d_str = f"{ad_year}-{parts[1]}-{parts[2]}"
+            if resp.status_code == 200 and resp.text.strip():
+                res_json = resp.json()
+                if "data" in res_json:
+                    for row in res_json["data"]:
+                        parts = row[0].split("/")
+                        ad_year = int(parts[0]) + 1911
+                        d_str = f"{ad_year}-{parts[1]}-{parts[2]}"
+
+                        def clean_val(v):
+                            return float(str(v).replace(",", ""))
+
+                        records.append(
+                            {
+                                "Date": d_str,
+                                "Open": clean_val(row[1]),
+                                "High": clean_val(row[2]),
+                                "Low": clean_val(row[3]),
+                                "Close": clean_val(row[4]),
+                            }
+                        )
+        except Exception:
+            continue
+
+    if not records:
+        raise ValueError("加權指數連線失敗，請稍候重試。")
+
+    df = pd.DataFrame(records).drop_duplicates(subset=["Date"])
+    df["Date"] = pd.to_datetime(df["Date"])
+    df.set_index("Date", inplace=True)
+    df.sort_index(inplace=True)
+    return df
+
+
+# --- 2. 抓取櫃買指數 (TPEx 歷史資料) ---
+def fetch_tpex_index(months: int = 3) -> pd.DataFrame:
+    records = []
+    today = datetime.now()
+
+    for i in range(months):
+        target_date = today - timedelta(days=i * 30)
+        roc_year = target_date.year - 1911
+        roc_month = f"{target_date.month:02d}"
+        url = f"https://www.tpex.org.tw/web/stock/aftertrading/index_history/history_result.php?l=zh-tw&d={roc_year}/{roc_month}"
+
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=8)
+            if resp.status_code == 200 and resp.text.strip():
+                res_json = resp.json()
+                data_list = res_json.get("aaData") or res_json.get("data") or []
+                for row in data_list:
+                    parts = str(row[0]).split("/")
+                    if len(parts) < 3:
+                        continue
+                    ad_year = (
+                        int(parts[0]) + 1911
+                        if int(parts[0]) < 1900
+                        else int(parts[0])
+                    )
+                    d_str = f"{ad_year}-{int(parts[1]):02d}-{int(parts[2]):02d}"
 
                     def clean_val(v):
-                        return float(v.replace(",", ""))
+                        return float(str(v).replace(",", ""))
 
                     records.append(
                         {
@@ -48,7 +100,7 @@ def fetch_twse_index(months: int = 3) -> pd.DataFrame:
             continue
 
     if not records:
-        raise ValueError("加權指數連線失敗，請稍候重試。")
+        raise ValueError("櫃買指數資料取得為空，請稍候重試。")
 
     df = pd.DataFrame(records).drop_duplicates(subset=["Date"])
     df["Date"] = pd.to_datetime(df["Date"])
@@ -57,55 +109,8 @@ def fetch_twse_index(months: int = 3) -> pd.DataFrame:
     return df
 
 
-# --- 2. 抓取櫃買指數 (TPEx 官方 OpenAPI) ---
-def fetch_tpex_index() -> pd.DataFrame:
-    url = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_index"
-    resp = requests.get(url, headers=HEADERS, timeout=10)
-    if resp.status_code != 200:
-        raise ValueError(
-            f"櫃買 OpenAPI 連線失敗 (HTTP {resp.status_code})"
-        )
-
-    data = resp.json()
-    records = []
-    for row in data:
-        d_raw = str(row.get("Date", ""))
-        # 處理日期格式 (8碼西元或民國格式)
-        if len(d_raw) == 8 and d_raw.isdigit():
-            d_str = f"{d_raw[:4]}-{d_raw[4:6]}-{d_raw[6:]}"
-        elif "/" in d_raw:
-            parts = d_raw.split("/")
-            ad_year = int(parts[0]) + 1911 if int(parts[0]) < 1900 else int(parts[0])
-            d_str = f"{ad_year}-{int(parts[1]):02d}-{int(parts[2]):02d}"
-        else:
-            continue
-
-        try:
-            records.append(
-                {
-                    "Date": d_str,
-                    "Open": float(str(row.get("OpeningIndex", 0)).replace(",", "")),
-                    "High": float(str(row.get("HighestIndex", 0)).replace(",", "")),
-                    "Low": float(str(row.get("LowestIndex", 0)).replace(",", "")),
-                    "Close": float(str(row.get("ClosingIndex", 0)).replace(",", "")),
-                }
-            )
-        except Exception:
-            continue
-
-    if not records:
-        raise ValueError("櫃買指數資料解析為空。")
-
-    df = pd.DataFrame(records).drop_duplicates(subset=["Date"])
-    df["Date"] = pd.to_datetime(df["Date"])
-    df.set_index("Date", inplace=True)
-    df.sort_index(inplace=True)
-    return df
-
-
-# --- 3. 抓取台指期 (近月連續月) 日K資料 ---
+# --- 3. 抓取台指期 (近月連續合約) ---
 def fetch_tx_futures() -> pd.DataFrame:
-    # 透過期交所歷史日報下載 CSV (包含連續 30 個交易日)
     today = datetime.now()
     start_date = today - timedelta(days=60)
     url = "https://www.taifex.com.tw/cht/3/futDataDown"
@@ -119,64 +124,55 @@ def fetch_tx_futures() -> pd.DataFrame:
 
     resp = requests.post(url, data=payload, headers=HEADERS, timeout=10)
     if resp.status_code != 200 or not resp.text.strip():
-        # 備援：若 POST 失敗，嘗試呼叫期交所 OpenAPI
-        api_url = "https://openapi.taifex.com.tw/v1/DailyMarketReportFut"
-        api_resp = requests.get(api_url, headers=HEADERS, timeout=10)
-        data = api_resp.json()
-        tx_records = []
-        for item in data:
-            if item.get("ContractCode") == "TX" and item.get("TradingSession") in ["", "0", "Regular"]:
-                d_raw = str(item.get("Date", ""))
-                d_str = f"{d_raw[:4]}-{d_raw[4:6]}-{d_raw[6:]}" if len(d_raw) == 8 else d_raw
-                tx_records.append(
-                    {
-                        "Date": d_str,
-                        "Month": str(item.get("DeliveryMonth", "")),
-                        "Open": float(str(item.get("OpenPrice", 0)).replace(",", "")),
-                        "High": float(str(item.get("HighPrice", 0)).replace(",", "")),
-                        "Low": float(str(item.get("LowPrice", 0)).replace(",", "")),
-                        "Close": float(str(item.get("SettlementPrice") or item.get("ClosePrice", 0)).replace(",", "")),
-                    }
-                )
-        raw_df = pd.DataFrame(tx_records)
-    else:
-        # 解析 CSV (big5 編碼)
-        content = resp.content.decode("big5", errors="ignore")
-        csv_df = pd.read_csv(io.StringIO(content))
-        # 整理欄位
-        csv_df.columns = [c.strip() for c in csv_df.columns]
-        # 篩選一般交易時段
-        if "交易時段" in csv_df.columns:
-            csv_df = csv_df[csv_df["交易時段"].astype(str).str.contains("一般|0")]
+        raise ValueError("期交所連線失敗或目前無回應。")
 
-        # 篩選欄位：交易日期, 到期月份, 開盤價, 最高價, 最低價, 收盤價/結算價
-        records = []
-        for _, row in csv_df.iterrows():
-            d_raw = str(row.get("交易日期", "")).strip().replace("/", "-")
-            month = str(row.get("到期月份(週別)", "")).strip()
-            if "/" in month:  # 排除跨月價差合約
-                continue
-            try:
-                records.append(
-                    {
-                        "Date": d_raw,
-                        "Month": month,
-                        "Open": float(str(row.get("開盤價", 0)).replace(",", "").replace("-", "0")),
-                        "High": float(str(row.get("最高價", 0)).replace(",", "").replace("-", "0")),
-                        "Low": float(str(row.get("最低價", 0)).replace(",", "").replace("-", "0")),
-                        "Close": float(str(row.get("收盤價") or row.get("結算價", 0)).replace(",", "").replace("-", "0")),
-                    }
-                )
-            except Exception:
-                continue
-        raw_df = pd.DataFrame(records)
+    content = resp.content.decode("big5", errors="ignore")
+    csv_df = pd.read_csv(io.StringIO(content))
+    csv_df.columns = [c.strip() for c in csv_df.columns]
 
-    if raw_df.empty:
-        raise ValueError("台指期資料取得為空，請確認是否為交易時段後。")
+    # 篩選日間交易盤
+    if "交易時段" in csv_df.columns:
+        csv_df = csv_df[csv_df["交易時段"].astype(str).str.contains("一般|0")]
 
-    raw_df = raw_df[raw_df["Open"] > 0]
+    records = []
+    for _, row in csv_df.iterrows():
+        d_raw = str(row.get("交易日期", "")).strip().replace("/", "-")
+        month = str(row.get("到期月份(週別)", "")).strip()
+        if "/" in month or not d_raw:  # 排除跨月價差合約
+            continue
+
+        def parse_price(val):
+            s = (
+                str(val)
+                .replace(",", "")
+                .replace("-", "")
+                .replace("None", "")
+                .strip()
+            )
+            return float(s) if s else 0.0
+
+        o_p = parse_price(row.get("開盤價"))
+        h_p = parse_price(row.get("最高價"))
+        l_p = parse_price(row.get("最低價"))
+        c_p = parse_price(row.get("收盤價")) or parse_price(row.get("結算價"))
+
+        if o_p > 0 and c_p > 0:
+            records.append(
+                {
+                    "Date": d_raw,
+                    "Month": month,
+                    "Open": o_p,
+                    "High": h_p,
+                    "Low": l_p,
+                    "Close": c_p,
+                }
+            )
+
+    if not records:
+        raise ValueError("台指期近期資料解析為空。")
+
+    raw_df = pd.DataFrame(records)
     raw_df.sort_values(by=["Date", "Month"], inplace=True)
-    # 各交易日只取近月合約 (第一筆)
     near_df = raw_df.groupby("Date").first().reset_index()
 
     near_df["Date"] = pd.to_datetime(near_df["Date"])
@@ -327,10 +323,10 @@ def get_stock_three_passes(user_input: str, days: int = 30):
     return result, next_day_passes, target_name, None
 
 
-# --- 網頁畫面呈現 ---
+# --- 介面呈現 ---
 st.title("三關價分析看板")
 st.caption(
-    "支援輸入：個股代號 (如: 2330 / 8069)、大盤 (加權)、櫃買 (上櫃)、台指期 (TX)"
+    "支援輸入：個股代號 (如: 2330)、大盤 (加權)、櫃買 (上櫃)、台指期 (TX)"
 )
 
 col1, col2 = st.columns([3, 1])
