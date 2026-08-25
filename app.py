@@ -8,7 +8,7 @@ st.set_page_config(page_title="三關價分析看板", layout="wide")
 
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
 
 
@@ -29,7 +29,7 @@ def get_stock_info_map() -> dict:
 
 
 # --- 2. 抓取台股 / 大盤 / 櫃買 ---
-def fetch_stock_or_index(data_id: str, days: int = 45) -> pd.DataFrame:
+def fetch_stock_or_index(data_id: str, days: int = 60) -> pd.DataFrame:
     start_date = (datetime.now() - timedelta(days=days * 2)).strftime(
         "%Y-%m-%d"
     )
@@ -62,7 +62,7 @@ def fetch_stock_or_index(data_id: str, days: int = 45) -> pd.DataFrame:
 
 
 # --- 3. 抓取台指期近月日K ---
-def fetch_tx_futures(days: int = 45) -> pd.DataFrame:
+def fetch_tx_futures(days: int = 60) -> pd.DataFrame:
     start_date = (datetime.now() - timedelta(days=days * 2)).strftime(
         "%Y-%m-%d"
     )
@@ -101,29 +101,58 @@ def fetch_tx_futures(days: int = 45) -> pd.DataFrame:
     return near_df[["Open", "High", "Low", "Close"]]
 
 
-# --- 4. 抓取美股費城半導體指數 (SOX) ---
-def fetch_sox_index(days: int = 45) -> pd.DataFrame:
-    url = "https://stooq.com/q/d/l/?s=^sox&i=d"
+# --- 4. 抓取美股費城半導體指數 (SOX / SOXX) ---
+def fetch_sox_index(days: int = 60) -> pd.DataFrame:
+    # 透過 Yahoo Finance 公開 Chart API 抓取
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ESOX?range=6mo&interval=1d"
     resp = requests.get(url, headers=HEADERS, timeout=10)
-    if resp.status_code != 200 or not resp.text.strip():
-        raise ValueError("費城半導體指數連線失敗。")
 
-    df = pd.read_csv(io.StringIO(resp.text))
-    if df.empty or "Close" not in df.columns:
-        raise ValueError("費城半導體指數解析為空。")
+    if resp.status_code == 200:
+        res = resp.json()
+        result = res.get("chart", {}).get("result")
+        if result:
+            quote = result[0]
+            timestamps = quote.get("timestamp", [])
+            indicators = quote.get("indicators", {}).get("quote", [{}])[0]
 
-    df["Date"] = pd.to_datetime(df["Date"])
-    df.set_index("Date", inplace=True)
-    df.sort_index(inplace=True)
-    return df[["Open", "High", "Low", "Close"]]
+            dates = [datetime.fromtimestamp(ts).date() for ts in timestamps]
+            df = pd.DataFrame(
+                {
+                    "Date": pd.to_datetime(dates),
+                    "Open": indicators.get("open"),
+                    "High": indicators.get("high"),
+                    "Low": indicators.get("low"),
+                    "Close": indicators.get("close"),
+                }
+            )
+            df.dropna(inplace=True)
+            df.set_index("Date", inplace=True)
+            df.sort_index(inplace=True)
+            if not df.empty:
+                return df[["Open", "High", "Low", "Close"]]
+
+    # 備援：若 API 被擋則透過 Stooq 下載 SOXX.US (費半 ETF)
+    alt_url = "https://stooq.com/q/d/l/?s=soxx.us&i=d"
+    alt_resp = requests.get(alt_url, headers=HEADERS, timeout=10)
+    if alt_resp.status_code == 200 and alt_resp.text.strip():
+        df = pd.read_csv(io.StringIO(alt_resp.text))
+        if not df.empty and "Close" in df.columns:
+            df["Date"] = pd.to_datetime(df["Date"])
+            df.set_index("Date", inplace=True)
+            df.sort_index(inplace=True)
+            return df[["Open", "High", "Low", "Close"]]
+
+    raise ValueError("費城半導體指數資料取得失敗，請稍候重試。")
 
 
-# --- 三關價核心運算與計算模型 ---
+# --- 核心計算：日三關價、周關鍵價、月關鍵價 ---
 def compute_three_passes_df(df: pd.DataFrame, days: int = 30):
     if df.empty or len(df) < 2:
         return None, None
 
     calc_df = df.copy()
+
+    # 1. 日線漲跌與三關價
     calc_df["昨收"] = calc_df["Close"].shift(1)
     calc_df["漲跌"] = calc_df["Close"] - calc_df["昨收"]
     calc_df["漲跌幅(%)"] = (calc_df["漲跌"] / calc_df["昨收"]) * 100
@@ -139,6 +168,19 @@ def compute_three_passes_df(df: pd.DataFrame, days: int = 30):
     calc_df["中關(日關)"] = (prev_high + prev_low) / 2
     calc_df["下關(多方防守)"] = prev_low - (diff * 0.382)
 
+    # 2. 周關鍵價 (當周累計最高與最低之中心價)
+    calc_df["Year_Week"] = calc_df.index.to_period("W")
+    week_high = calc_df.groupby("Year_Week")["High"].cummax()
+    week_low = calc_df.groupby("Year_Week")["Low"].cummin()
+    calc_df["周關鍵價"] = (week_high + week_low) / 2
+
+    # 3. 月關鍵價 (當月累計最高與最低之中心價)
+    calc_df["Year_Month"] = calc_df.index.to_period("M")
+    month_high = calc_df.groupby("Year_Month")["High"].cummax()
+    month_low = calc_df.groupby("Year_Month")["Low"].cummin()
+    calc_df["月關鍵價"] = (month_high + month_low) / 2
+
+    # 4. 說明區間判斷
     def judge_position(row):
         close = row["Close"]
         up = row["上關(空方防守)"]
@@ -158,6 +200,7 @@ def compute_three_passes_df(df: pd.DataFrame, days: int = 30):
 
     calc_df["說明"] = calc_df.apply(judge_position, axis=1)
 
+    # 推算明日
     latest_row = calc_df.iloc[-1]
     curr_high = latest_row["High"]
     curr_low = latest_row["Low"]
@@ -171,6 +214,8 @@ def compute_three_passes_df(df: pd.DataFrame, days: int = 30):
         "next_up": curr_high + (curr_diff * 0.382),
         "next_mid": (curr_high + curr_low) / 2,
         "next_down": curr_low - (curr_diff * 0.382),
+        "curr_week_key": latest_row["周關鍵價"],
+        "curr_month_key": latest_row["月關鍵價"],
         "today_note": latest_row["說明"],
     }
 
@@ -183,6 +228,7 @@ def compute_three_passes_df(df: pd.DataFrame, days: int = 30):
         },
         inplace=True,
     )
+
     cols = [
         "開盤",
         "最高",
@@ -195,6 +241,8 @@ def compute_three_passes_df(df: pd.DataFrame, days: int = 30):
         "上關(空方防守)",
         "中關(日關)",
         "下關(多方防守)",
+        "周關鍵價",
+        "月關鍵價",
         "說明",
     ]
 
@@ -234,6 +282,7 @@ def get_target_data(user_input: str, days: int = 30):
             "費城半導體",
             "SOX",
             "^SOX",
+            "SOXX",
             "費城半導體指數",
         ]:
             df = fetch_sox_index(days=days)
@@ -254,23 +303,24 @@ def get_target_data(user_input: str, days: int = 30):
         return None, None, None, f"查詢失敗：{str(e)}"
 
 
-# --- 取得大盤、櫃買、台指期近5日摘要 ---
+# --- 取得市場四大核心概況看板 ---
 @st.cache_data(ttl=300)
 def get_market_overview():
     items = [
-        ("加權指數 (大盤)", lambda: fetch_stock_or_index("TAIEX", days=15)),
-        ("櫃買指數 (TPEx)", lambda: fetch_stock_or_index("TPEx", days=15)),
-        ("台指期 (近月)", lambda: fetch_tx_futures(days=15)),
+        ("加權指數 (大盤)", lambda: fetch_stock_or_index("TAIEX", days=20)),
+        ("櫃買指數 (TPEx)", lambda: fetch_stock_or_index("TPEx", days=20)),
+        ("台指期 (近月)", lambda: fetch_tx_futures(days=20)),
+        ("費城半導體 (SOX)", lambda: fetch_sox_index(days=20)),
     ]
-    overview_data = {}
+    overview_list = []
     for name, fetch_func in items:
         try:
             df = fetch_func()
-            res, _ = compute_three_passes_df(df, days=5)
-            overview_data[name] = res
-        except Exception:
-            overview_data[name] = None
-    return overview_data
+            _, next_info = compute_three_passes_df(df, days=5)
+            overview_list.append((name, next_info, None))
+        except Exception as e:
+            overview_list.append((name, None, str(e)))
+    return overview_list
 
 
 # --- 樣式設定輔助函式 ---
@@ -300,46 +350,42 @@ def color_description(val):
 # ================= 網頁畫面呈現 =================
 st.title("三關價分析看板")
 
-# --- 頂部常駐：大盤、櫃買、台指期近5日位階總覽 ---
-st.markdown("### 🌐 市場核心指數・近 5 日關鍵位階總覽")
-overview = get_market_overview()
+# --- 1. 頂部常駐：市場核心指數直觀看板 ---
+st.markdown("### 🌐 市場核心指數・即時位階與關鍵價看板")
+overview_data = get_market_overview()
 
-tabs = st.tabs(["🏛️ 加權指數 (大盤)", "🏢 櫃買指數 (TPEx)", "⚡ 台指期貨 (近月)"])
-for idx, (market_name, market_df) in enumerate(overview.items()):
-    with tabs[idx]:
-        if market_df is not None:
-            # 簡要欄位呈現
-            display_cols = [
-                "收盤",
-                "漲跌",
-                "漲跌幅(%)",
-                "上關(空方防守)",
-                "中關(日關)",
-                "下關(多方防守)",
-                "說明",
-            ]
-            styled_market = (
-                market_df[display_cols]
-                .style.format(
-                    {
-                        "收盤": "{:.2f}",
-                        "漲跌": "{:+.2f}",
-                        "漲跌幅(%)": "{:+.2f}%",
-                        "上關(空方防守)": "{:.2f}",
-                        "中關(日關)": "{:.2f}",
-                        "下關(多方防守)": "{:.2f}",
-                    }
-                )
-                .map(color_change, subset=["漲跌", "漲跌幅(%)"])
-                .map(color_description, subset=["說明"])
+cols_top = st.columns(4)
+for idx, (market_name, info, err) in enumerate(overview_data):
+    with cols_top[idx]:
+        if info:
+            st.markdown(
+                f"<div style='border: 1px solid #333; border-radius: 8px; padding: 12px; background-color: rgba(255,255,255,0.03);'>"
+                f"<h4 style='margin:0; font-size:16px;'>{market_name}</h4>"
+                f"<p style='color: gray; font-size: 12px; margin: 2px 0 8px 0;'>收盤日期：{info['latest_date']}</p>"
+                f"<div style='font-size: 20px; font-weight: bold;'>{info['latest_close']:.2f} "
+                f"<span style='font-size: 13px; color: {'#ff4b4b' if info['latest_change'] > 0 else '#09ab3b'};'>"
+                f"{info['latest_change']:+.2f} ({info['latest_pct']:+.2f}%)</span></div>"
+                f"<hr style='margin: 8px 0; border: none; border-top: 1px solid #444;'/>"
+                f"<div style='font-size: 13px; line-height: 1.6;'>"
+                f"<b>明日上關(空防)：</b> {info['next_up']:.2f}<br/>"
+                f"<b>明日中關(日關)：</b> {info['next_mid']:.2f}<br/>"
+                f"<b>明日下關(多防)：</b> {info['next_down']:.2f}<br/>"
+                f"<b>本周關鍵價：</b> {info['curr_week_key']:.2f}<br/>"
+                f"<b>本月關鍵價：</b> {info['curr_month_key']:.2f}<br/>"
+                f"</div>"
+                f"<div style='margin-top: 8px; padding: 4px; border-radius: 4px; text-align: center; font-size: 12px; font-weight: bold; "
+                f"background-color: {'rgba(211,47,47,0.2)' if '漲破' in info['today_note'] or '強勢' in info['today_note'] else 'rgba(230,81,0,0.2)' if '偏多' in info['today_note'] else 'rgba(46,125,50,0.2)' if '偏空' in info['today_note'] else 'rgba(27,94,32,0.2)'}; "
+                f"color: {'#ff5252' if '漲破' in info['today_note'] or '強勢' in info['today_note'] else '#ffa726' if '偏多' in info['today_note'] else '#66bb6a' if '偏空' in info['today_note'] else '#81c784'};'>"
+                f"{info['today_note']}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
             )
-            st.dataframe(styled_market, use_container_width=True)
         else:
-            st.warning(f"暫無法取得 {market_name} 最新 5 日數據。")
+            st.error(f"{market_name} 資料載入失敗")
 
 st.markdown("---")
 
-# --- 下方搜尋與詳細歷史分析 ---
+# --- 2. 下方個別深度查詢 ---
 st.subheader("🔍 個股與指數個別深度查詢")
 st.caption(
     "支援輸入：個股代號 (如: 2330)、大盤、櫃買、台指期、費半 (SOX)"
@@ -367,32 +413,43 @@ if user_input:
         st.error(err)
     else:
         st.markdown(
-            f"### 📊 【{target_name}】最新收盤 ({next_info['latest_date']}) 與 預計明日三關價"
+            f"### 📊 【{target_name}】最新收盤 ({next_info['latest_date']}) 與 關鍵位階"
         )
 
-        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-        kpi1.metric(
-            f"最新收盤價 ({next_info['latest_date']})",
+        # 6 格 KPI 指標：收盤、明日上關、中關、下關、周關鍵價、月關鍵價
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        k1.metric(
+            f"最新收盤 ({next_info['latest_date']})",
             f"{next_info['latest_close']:.2f}",
             f"{next_info['latest_change']:+.2f} ({next_info['latest_pct']:+.2f}%)",
         )
-        kpi2.metric(
-            "預計明日 上關 (空防)",
+        k2.metric(
+            "預計明日 上關",
             f"{next_info['next_up']:.2f}",
             help="明日空方防守價位",
         )
-        kpi3.metric(
-            "預計明日 中關 (日關)",
+        k3.metric(
+            "預計明日 中關",
             f"{next_info['next_mid']:.2f}",
             help="明日多空強弱分水嶺",
         )
-        kpi4.metric(
-            "預計明日 下關 (多防)",
+        k4.metric(
+            "預計明日 下關",
             f"{next_info['next_down']:.2f}",
             help="明日多方防守價位",
         )
+        k5.metric(
+            "本周關鍵價",
+            f"{next_info['curr_week_key']:.2f}",
+            help="當周高低點中心價",
+        )
+        k6.metric(
+            "本月關鍵價",
+            f"{next_info['curr_month_key']:.2f}",
+            help="當月高低點中心價",
+        )
 
-        # 狀態卡片醒目標註
+        # 狀態醒目標註卡片
         note_text = next_info["today_note"]
         if "強勢" in note_text or "漲破" in note_text:
             st.error(f"🔥 **最新交易日型態結算：{note_text}**")
@@ -419,6 +476,8 @@ if user_input:
                     "上關(空方防守)": "{:.2f}",
                     "中關(日關)": "{:.2f}",
                     "下關(多方防守)": "{:.2f}",
+                    "周關鍵價": "{:.2f}",
+                    "月關鍵價": "{:.2f}",
                 }
             )
             .map(color_change, subset=["漲跌", "漲跌幅(%)"])
