@@ -152,14 +152,14 @@ def fetch_sox_index(days: int = 120) -> pd.DataFrame:
     raise ValueError("費城半導體指數資料取得失敗。")
 
 
-# --- 5. 波段策略、損益追蹤與三關價核心引擎 ---
+# --- 5. 波段策略核心引擎 (含防雙巴濾網與狀態機) ---
 def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
     if df.empty or len(df) < 25:
         return None, None
 
     calc_df = df.copy()
 
-    # 1. 基礎數據
+    # (1) 基礎計算
     calc_df["昨收"] = calc_df["Close"].shift(1)
     calc_df["漲跌"] = calc_df["Close"] - calc_df["昨收"]
     calc_df["漲跌幅(%)"] = (calc_df["漲跌"] / calc_df["昨收"]) * 100
@@ -167,7 +167,7 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
         (calc_df["High"] - calc_df["Low"]) / calc_df["昨收"]
     ) * 100
 
-    # 2. 三關價 (空防 / AC / 多防)
+    # (2) 三關價 (空防 / AC / 多防)
     prev_high = calc_df["High"].shift(1)
     prev_low = calc_df["Low"].shift(1)
     diff = prev_high - prev_low
@@ -176,7 +176,7 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
     calc_df["AC"] = (prev_high + prev_low) / 2
     calc_df["多防"] = prev_low - (diff * 0.382)
 
-    # 3. 周關 / 月關
+    # (3) 周關 / 月關
     calc_df["Year_Week"] = calc_df.index.to_period("W")
     week_high = calc_df.groupby("Year_Week")["High"].cummax()
     week_low = calc_df.groupby("Year_Week")["Low"].cummin()
@@ -187,7 +187,7 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
     month_low = calc_df.groupby("Year_Month")["Low"].cummin()
     calc_df["月關"] = (month_high + month_low) / 2
 
-    # 4. 趨勢大環境判斷 (台股慣例：多頭紅色 🔴、空頭綠色 🟢)
+    # (4) 趨勢大環境判斷 (台股慣例：多頭紅色 🔴 / 空頭綠色 🟢 / 震盪黃色 🟡)
     def get_trend_env(row):
         c, w, m = row["Close"], row["周關"], row["月關"]
         if pd.isna(w) or pd.isna(m):
@@ -201,7 +201,7 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
 
     calc_df["趨勢環境"] = calc_df.apply(get_trend_env, axis=1)
 
-    # 5. 型態說明
+    # (5) 型態說明 (當日三關位階)
     def judge_position(row):
         close = row["Close"]
         up = row["空防"]
@@ -220,7 +220,7 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
 
     calc_df["型態說明"] = calc_df.apply(judge_position, axis=1)
 
-    # 6. 狀態機：計算訊號、進場價、出場價、獲利% 與 防守價
+    # (6) 狀態機與防雙巴運算
     signals = []
     positions = []
     holding_days = []
@@ -229,9 +229,10 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
     pnl_percents = []
     defense_prices = []
 
-    curr_pos = "NONE"  # NONE, LONG_100, LONG_50, SHORT_100, SHORT_50
+    curr_pos = "NONE"
     days_in_trade = 0
     active_entry_price = np.nan
+    cooldown_counter = 0
 
     for i in range(len(calc_df)):
         row = calc_df.iloc[i]
@@ -251,21 +252,26 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
             defense_prices.append(np.nan)
             continue
 
-        sig = "觀望等待"
+        sig = "空倉觀望"
         recorded_entry = np.nan
         recorded_exit = np.nan
         calculated_pnl = np.nan
 
-        # --- 狀態切換邏輯 ---
+        if cooldown_counter > 0:
+            cooldown_counter -= 1
+
+        # 狀態切換邏輯
         if curr_pos == "NONE":
-            if c > up and ("多頭" in trend or c > row["月關"]):
+            # 多頭環境 + 實質突破 + 非冷卻期
+            if c > (up * 1.002) and "多頭" in trend and cooldown_counter == 0:
                 curr_pos = "LONG_100"
                 days_in_trade = 1
                 active_entry_price = c
                 recorded_entry = active_entry_price
                 calculated_pnl = 0.0
                 sig = "🔥 多單進場"
-            elif c < dn and ("空頭" in trend or c < row["月關"]):
+            # 空頭環境 + 實質跌破 + 非冷卻期
+            elif c < (dn * 0.998) and "空頭" in trend and cooldown_counter == 0:
                 curr_pos = "SHORT_100"
                 days_in_trade = 1
                 active_entry_price = c
@@ -275,23 +281,29 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
             else:
                 days_in_trade = 0
                 active_entry_price = np.nan
-                sig = "空倉觀望"
+                sig = "冷卻觀望" if cooldown_counter > 0 else "空倉觀望"
 
         elif "LONG" in curr_pos:
             days_in_trade += 1
             recorded_entry = active_entry_price
-            if c < dn:  # 跌破多方防守 -> 清倉出場
+
+            if c < dn:
                 recorded_exit = c
                 calculated_pnl = ((recorded_exit - active_entry_price) / active_entry_price) * 100
                 curr_pos = "NONE"
                 sig = "🚨 多單清倉"
                 days_in_trade = 0
                 active_entry_price = np.nan
-            elif c < mid and curr_pos == "LONG_100":  # 破 AC 減碼
+                cooldown_counter = 2
+            elif days_in_trade >= 5 and c < active_entry_price and curr_pos == "LONG_100":
+                curr_pos = "LONG_50"
+                calculated_pnl = ((c - active_entry_price) / active_entry_price) * 100
+                sig = "⏱️ 時間減碼50%"
+            elif c < mid and curr_pos == "LONG_100":
                 curr_pos = "LONG_50"
                 calculated_pnl = ((c - active_entry_price) / active_entry_price) * 100
                 sig = "⚠️ 多單減碼50%"
-            elif c > up and curr_pos == "LONG_50":  # 重返強勢加碼
+            elif c > up and curr_pos == "LONG_50":
                 curr_pos = "LONG_100"
                 calculated_pnl = ((c - active_entry_price) / active_entry_price) * 100
                 sig = "➕ 多單加碼"
@@ -302,14 +314,20 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
         elif "SHORT" in curr_pos:
             days_in_trade += 1
             recorded_entry = active_entry_price
-            if c > up:  # 漲破空方防守 -> 清倉出場
+
+            if c > up:
                 recorded_exit = c
                 calculated_pnl = ((active_entry_price - recorded_exit) / active_entry_price) * 100
                 curr_pos = "NONE"
                 sig = "🚨 空單清倉"
                 days_in_trade = 0
                 active_entry_price = np.nan
-            elif c > mid and curr_pos == "SHORT_100":  # 突破 AC 減碼
+                cooldown_counter = 2
+            elif days_in_trade >= 5 and c > active_entry_price and curr_pos == "SHORT_100":
+                curr_pos = "SHORT_50"
+                calculated_pnl = ((active_entry_price - c) / active_entry_price) * 100
+                sig = "⏱️ 時間減碼50%"
+            elif c > mid and curr_pos == "SHORT_100":
                 curr_pos = "SHORT_50"
                 calculated_pnl = ((active_entry_price - c) / active_entry_price) * 100
                 sig = "⚠️ 空單減碼50%"
@@ -349,7 +367,6 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
     calc_df["獲利(%)"] = pnl_percents
     calc_df["防守價"] = defense_prices
 
-    # 預估明日指標
     latest_row = calc_df.iloc[-1]
     curr_high = latest_row["High"]
     curr_low = latest_row["Low"]
@@ -541,11 +558,29 @@ cols_top = st.columns(4)
 for idx, (market_name, info, err) in enumerate(overview_data):
     with cols_top[idx]:
         if info:
+            trend_bg = (
+                "rgba(255, 75, 75, 0.15)"
+                if "多頭" in info["trend_env"]
+                else (
+                    "rgba(9, 171, 59, 0.15)"
+                    if "空頭" in info["trend_env"]
+                    else "rgba(255, 235, 59, 0.1)"
+                )
+            )
+            trend_color = (
+                "#ff5252"
+                if "多頭" in info["trend_env"]
+                else (
+                    "#69f0ae"
+                    if "空頭" in info["trend_env"]
+                    else "#ffee58"
+                )
+            )
             st.markdown(
                 f"<div style='border: 1px solid #333; border-radius: 8px; padding: 12px; background-color: rgba(255,255,255,0.03);'>"
                 f"<div style='display:flex; justify-content:space-between; align-items:center;'>"
                 f"<h4 style='margin:0; font-size:15px;'>{market_name}</h4>"
-                f"<span style='font-size:11px; padding:2px 6px; border-radius:4px; background-color:#222;'>{info['trend_env']}</span>"
+                f"<span style='font-size:11px; padding:2px 6px; border-radius:4px; background-color:{trend_bg}; color:{trend_color}; font-weight:bold;'>{info['trend_env']}</span>"
                 f"</div>"
                 f"<p style='color: gray; font-size: 11px; margin: 2px 0 6px 0;'>日期：{info['latest_date']}</p>"
                 f"<div style='font-size: 18px; font-weight: bold;'>{info['latest_close']:.2f} "
@@ -579,8 +614,8 @@ col1, col2 = st.columns([3, 1])
 with col1:
     user_input = st.text_input(
         "請輸入股號或標的名稱",
-        value="2301",
-        help="可輸入：2301、2330、大盤、櫃買、台指期、費半...",
+        value="2330",
+        help="可輸入：2330、大盤、櫃買、台指期、費半...",
     )
 with col2:
     days_to_show = st.number_input(
@@ -607,16 +642,15 @@ if user_input:
             f"{next_info['latest_change']:+.2f} ({next_info['latest_pct']:+.2f}%)",
         )
         k2.metric("趨勢大環境", next_info["trend_env"])
-        
-        # 持倉與損益顯示
+
         pnl_val = next_info["today_pnl"]
-        pnl_display = f"{pnl_val:+.2f}%" if pd.notna(pnl_val) else "0.00%"
+        pnl_display = f"{pnl_val:+.2f}%" if pd.notna(pnl_val) else "-"
         k3.metric(
             "目前持倉水位",
             f"{next_info['today_position']}",
             f"損益: {pnl_display} ({next_info['today_hold_days']}天)",
         )
-        
+
         defense_str = (
             f"{next_info['today_defense']:.2f}"
             if pd.notna(next_info["today_defense"])
@@ -634,7 +668,7 @@ if user_input:
             help="多方主要防守防線",
         )
 
-        # 訊號狀態提示卡
+        # 訊號狀態提示
         sig_color = (
             "error"
             if "多單" in next_info["today_signal"]
@@ -648,24 +682,31 @@ if user_input:
             f"🔔 **波段訊號：【{next_info['today_signal']}】** ｜ 型態：{next_info['today_note']} ｜ AC：{next_info['next_mid']:.2f} ｜ 周關：{next_info['curr_week_key']:.2f} ｜ 月關：{next_info['curr_month_key']:.2f}"
         )
 
-        # 詳細歷史決策與三關價報表
         st.write("#### 📋 交易訊號與關鍵價歷史記錄清單")
 
+        def fmt_val(val, fmt="{:.2f}"):
+            if pd.isna(val) or val is None or str(val).lower() == "none" or str(val).lower() == "nan":
+                return "-"
+            try:
+                return fmt.format(float(val))
+            except Exception:
+                return str(val)
+
         format_dict = {
-            "開盤": "{:.2f}",
-            "最高": "{:.2f}",
-            "最低": "{:.2f}",
-            "收盤": "{:.2f}",
-            "漲跌幅(%)": "{:+.2f}%",
-            "進場價": lambda x: f"{x:.2f}" if pd.notna(x) else "-",
-            "出場價": lambda x: f"{x:.2f}" if pd.notna(x) else "-",
-            "獲利(%)": lambda x: f"{x:+.2f}%" if pd.notna(x) else "-",
-            "防守價": lambda x: f"{x:.2f}" if pd.notna(x) else "-",
-            "空防": "{:.2f}",
-            "AC": "{:.2f}",
-            "多防": "{:.2f}",
-            "周關": "{:.2f}",
-            "月關": "{:.2f}",
+            "開盤": lambda x: fmt_val(x),
+            "最高": lambda x: fmt_val(x),
+            "最低": lambda x: fmt_val(x),
+            "收盤": lambda x: fmt_val(x),
+            "漲跌幅(%)": lambda x: fmt_val(x, "{:+.2f}%"),
+            "進場價": lambda x: fmt_val(x),
+            "出場價": lambda x: fmt_val(x),
+            "獲利(%)": lambda x: fmt_val(x, "{:+.2f}%"),
+            "防守價": lambda x: fmt_val(x),
+            "空防": lambda x: fmt_val(x),
+            "AC": lambda x: fmt_val(x),
+            "多防": lambda x: fmt_val(x),
+            "周關": lambda x: fmt_val(x),
+            "月關": lambda x: fmt_val(x),
         }
 
         styled_df = (
