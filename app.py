@@ -1,10 +1,11 @@
 from datetime import datetime, timedelta
 import io
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="三關價分析看板", layout="wide")
+st.set_page_config(page_title="三關價分析與波段決策系統", layout="wide")
 
 FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
 HEADERS = {
@@ -12,7 +13,7 @@ HEADERS = {
 }
 
 
-# --- 1. 股票代號與名稱對照表 (快取 1 天) ---
+# --- 1. 股票名稱對照表 (快取 1 天) ---
 @st.cache_data(ttl=86400)
 def get_stock_info_map() -> dict:
     try:
@@ -28,8 +29,8 @@ def get_stock_info_map() -> dict:
     return {}
 
 
-# --- 2. 抓取台股 / 大盤 / 櫃買 ---
-def fetch_stock_or_index(data_id: str, days: int = 60) -> pd.DataFrame:
+# --- 2. 抓取台股 / 大盤 / 櫃買 (含成交量) ---
+def fetch_stock_or_index(data_id: str, days: int = 120) -> pd.DataFrame:
     start_date = (datetime.now() - timedelta(days=days * 2)).strftime(
         "%Y-%m-%d"
     )
@@ -52,17 +53,20 @@ def fetch_stock_or_index(data_id: str, days: int = 60) -> pd.DataFrame:
             "max": "High",
             "min": "Low",
             "close": "Close",
+            "Trading_Volume": "Volume",
         },
         inplace=True,
     )
     df["Date"] = pd.to_datetime(df["Date"])
     df.set_index("Date", inplace=True)
     df.sort_index(inplace=True)
-    return df[["Open", "High", "Low", "Close"]]
+    if "Volume" not in df.columns:
+        df["Volume"] = 0
+    return df[["Open", "High", "Low", "Close", "Volume"]]
 
 
-# --- 3. 抓取台指期近月日K ---
-def fetch_tx_futures(days: int = 60) -> pd.DataFrame:
+# --- 3. 抓取台指期貨近月日K ---
+def fetch_tx_futures(days: int = 120) -> pd.DataFrame:
     start_date = (datetime.now() - timedelta(days=days * 2)).strftime(
         "%Y-%m-%d"
     )
@@ -92,19 +96,21 @@ def fetch_tx_futures(days: int = 60) -> pd.DataFrame:
             "max": "High",
             "min": "Low",
             "close": "Close",
+            "volume": "Volume",
         },
         inplace=True,
     )
     near_df["Date"] = pd.to_datetime(near_df["Date"])
     near_df.set_index("Date", inplace=True)
     near_df.sort_index(inplace=True)
-    return near_df[["Open", "High", "Low", "Close"]]
+    if "Volume" not in near_df.columns:
+        near_df["Volume"] = 0
+    return near_df[["Open", "High", "Low", "Close", "Volume"]]
 
 
-# --- 4. 抓取美股費城半導體指數 (SOX / SOXX) ---
-def fetch_sox_index(days: int = 60) -> pd.DataFrame:
-    # 透過 Yahoo Finance 公開 Chart API 抓取
-    url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ESOX?range=6mo&interval=1d"
+# --- 4. 抓取費城半導體指數 (SOX) ---
+def fetch_sox_index(days: int = 120) -> pd.DataFrame:
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ESOX?range=1y&interval=1d"
     resp = requests.get(url, headers=HEADERS, timeout=10)
 
     if resp.status_code == 200:
@@ -114,7 +120,6 @@ def fetch_sox_index(days: int = 60) -> pd.DataFrame:
             quote = result[0]
             timestamps = quote.get("timestamp", [])
             indicators = quote.get("indicators", {}).get("quote", [{}])[0]
-
             dates = [datetime.fromtimestamp(ts).date() for ts in timestamps]
             df = pd.DataFrame(
                 {
@@ -123,15 +128,15 @@ def fetch_sox_index(days: int = 60) -> pd.DataFrame:
                     "High": indicators.get("high"),
                     "Low": indicators.get("low"),
                     "Close": indicators.get("close"),
+                    "Volume": indicators.get("volume", [0] * len(dates)),
                 }
             )
-            df.dropna(inplace=True)
+            df.dropna(subset=["Close"], inplace=True)
             df.set_index("Date", inplace=True)
             df.sort_index(inplace=True)
             if not df.empty:
-                return df[["Open", "High", "Low", "Close"]]
+                return df[["Open", "High", "Low", "Close", "Volume"]]
 
-    # 備援：若 API 被擋則透過 Stooq 下載 SOXX.US (費半 ETF)
     alt_url = "https://stooq.com/q/d/l/?s=soxx.us&i=d"
     alt_resp = requests.get(alt_url, headers=HEADERS, timeout=10)
     if alt_resp.status_code == 200 and alt_resp.text.strip():
@@ -140,19 +145,21 @@ def fetch_sox_index(days: int = 60) -> pd.DataFrame:
             df["Date"] = pd.to_datetime(df["Date"])
             df.set_index("Date", inplace=True)
             df.sort_index(inplace=True)
-            return df[["Open", "High", "Low", "Close"]]
+            if "Volume" not in df.columns:
+                df["Volume"] = 0
+            return df[["Open", "High", "Low", "Close", "Volume"]]
 
-    raise ValueError("費城半導體指數資料取得失敗，請稍候重試。")
+    raise ValueError("費城半導體指數資料取得失敗。")
 
 
-# --- 核心計算：日三關價、周關鍵價、月關鍵價 ---
-def compute_three_passes_df(df: pd.DataFrame, days: int = 30):
-    if df.empty or len(df) < 2:
+# --- 5. 波段策略與三關價核心引擎 ---
+def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
+    if df.empty or len(df) < 25:
         return None, None
 
     calc_df = df.copy()
 
-    # 1. 日線漲跌與三關價
+    # (1) 基礎計算：昨收、漲跌、振幅
     calc_df["昨收"] = calc_df["Close"].shift(1)
     calc_df["漲跌"] = calc_df["Close"] - calc_df["昨收"]
     calc_df["漲跌幅(%)"] = (calc_df["漲跌"] / calc_df["昨收"]) * 100
@@ -160,6 +167,17 @@ def compute_three_passes_df(df: pd.DataFrame, days: int = 30):
         (calc_df["High"] - calc_df["Low"]) / calc_df["昨收"]
     ) * 100
 
+    # (2) ATR (14) 計算防假突破
+    tr1 = calc_df["High"] - calc_df["Low"]
+    tr2 = (calc_df["High"] - calc_df["Close"].shift(1)).abs()
+    tr3 = (calc_df["Low"] - calc_df["Close"].shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    calc_df["ATR14"] = tr.rolling(14).mean()
+
+    # (3) 20 日均量
+    calc_df["Vol_MA20"] = calc_df["Volume"].rolling(20).mean()
+
+    # (4) 三關價計算
     prev_high = calc_df["High"].shift(1)
     prev_low = calc_df["Low"].shift(1)
     diff = prev_high - prev_low
@@ -168,25 +186,133 @@ def compute_three_passes_df(df: pd.DataFrame, days: int = 30):
     calc_df["中關(日關)"] = (prev_high + prev_low) / 2
     calc_df["下關(多方防守)"] = prev_low - (diff * 0.382)
 
-    # 2. 周關鍵價 (當周累計最高與最低之中心價)
+    # (5) 周 / 月 關鍵價
     calc_df["Year_Week"] = calc_df.index.to_period("W")
     week_high = calc_df.groupby("Year_Week")["High"].cummax()
     week_low = calc_df.groupby("Year_Week")["Low"].cummin()
     calc_df["周關鍵價"] = (week_high + week_low) / 2
 
-    # 3. 月關鍵價 (當月累計最高與最低之中心價)
     calc_df["Year_Month"] = calc_df.index.to_period("M")
     month_high = calc_df.groupby("Year_Month")["High"].cummax()
     month_low = calc_df.groupby("Year_Month")["Low"].cummin()
     calc_df["月關鍵價"] = (month_high + month_low) / 2
 
-    # 4. 說明區間判斷
+    # (6) 趨勢環境判斷
+    def get_trend_env(row):
+        c, w, m = row["Close"], row["周關鍵價"], row["月關鍵價"]
+        if pd.isna(w) or pd.isna(m):
+            return "分析中"
+        if c >= w and c >= m:
+            return "多頭市場 🟢"
+        elif c <= w and c <= m:
+            return "空頭市場 🔴"
+        else:
+            return "震盪整理 🟡"
+
+    calc_df["趨勢環境"] = calc_df.apply(get_trend_env, axis=1)
+
+    # (7) 狀態機：計算波段訊號、持倉與防守價
+    signals = []
+    positions = []
+    holding_days = []
+    defense_prices = []
+
+    curr_pos = "NONE"  # NONE, LONG_100, LONG_50, SHORT_100, SHORT_50
+    days_in_trade = 0
+
+    for i in range(len(calc_df)):
+        row = calc_df.iloc[i]
+        c = row["Close"]
+        up = row["上關(空方防守)"]
+        mid = row["中關(日關)"]
+        dn = row["下關(多方防守)"]
+        trend = row["趨勢環境"]
+        vol = row["Volume"]
+        vol_ma = row["Vol_MA20"]
+
+        if pd.isna(up) or pd.isna(dn) or pd.isna(row["月關鍵價"]):
+            signals.append("計算中")
+            positions.append("無部位")
+            holding_days.append(0)
+            defense_prices.append(np.nan)
+            continue
+
+        sig = "續抱/觀望"
+        vol_burst = bool(vol > vol_ma * 1.5) if (vol_ma and vol_ma > 0) else False
+
+        # --- 訊號判定邏輯 ---
+        if curr_pos == "NONE":
+            if c > up and ("多頭" in trend or c > row["月關鍵價"]):
+                curr_pos = "LONG_100"
+                days_in_trade = 1
+                sig = "🔥 多單進場 (突破上關)"
+            elif c < dn and ("空頭" in trend or c < row["月關鍵價"]):
+                curr_pos = "SHORT_100"
+                days_in_trade = 1
+                sig = "❄️ 空單進場 (跌破下關)"
+            else:
+                days_in_trade = 0
+                sig = "觀望等待"
+
+        elif "LONG" in curr_pos:
+            days_in_trade += 1
+            if c < dn:  # 跌破多方防守 -> 停損/出場
+                curr_pos = "NONE"
+                sig = "🚨 多單清倉 (跌破下關)"
+                days_in_trade = 0
+            elif c < mid and curr_pos == "LONG_100":  # 破中關減碼
+                curr_pos = "LONG_50"
+                sig = "⚠️ 多單減碼 50% (破中關)"
+            elif c > up and curr_pos == "LONG_50":  # 再次轉強加回
+                curr_pos = "LONG_100"
+                sig = "➕ 多單加碼 (重登強勢)"
+            else:
+                sig = "多單續抱"
+
+        elif "SHORT" in curr_pos:
+            days_in_trade += 1
+            if c > up:  # 漲破空方防守 -> 停損/出場
+                curr_pos = "NONE"
+                sig = "🚨 空單清倉 (漲破上關)"
+                days_in_trade = 0
+            elif c > mid and curr_pos == "SHORT_100":  # 漲上中關減碼
+                curr_pos = "SHORT_50"
+                sig = "⚠️ 空單減碼 50% (站上中關)"
+            elif c < dn and curr_pos == "SHORT_50":
+                curr_pos = "SHORT_100"
+                sig = "➕ 空單加碼 (續創新低)"
+            else:
+                sig = "空單續抱"
+
+        # 紀錄持倉中文名稱與動態防守價
+        pos_display = {
+            "NONE": "無部位 (Cash)",
+            "LONG_100": "多方持有 (100%)",
+            "LONG_50": "多方持有 (50%)",
+            "SHORT_100": "空方持有 (100%)",
+            "SHORT_50": "空方持有 (50%)",
+        }.get(curr_pos, "無部位")
+
+        defense_val = (
+            dn if "LONG" in curr_pos else (up if "SHORT" in curr_pos else np.nan)
+        )
+
+        signals.append(sig)
+        positions.append(pos_display)
+        holding_days.append(days_in_trade)
+        defense_prices.append(defense_val)
+
+    calc_df["波段訊號"] = signals
+    calc_df["持倉狀態"] = positions
+    calc_df["持倉天數"] = holding_days
+    calc_df["動態防守價"] = defense_prices
+
+    # (8) 當日型態說明
     def judge_position(row):
         close = row["Close"]
         up = row["上關(空方防守)"]
         mid = row["中關(日關)"]
         down = row["下關(多方防守)"]
-
         if pd.isna(up) or pd.isna(mid) or pd.isna(down):
             return "計算中"
         if close > up:
@@ -198,9 +324,9 @@ def compute_three_passes_df(df: pd.DataFrame, days: int = 30):
         else:
             return "弱勢：跌破多方防守"
 
-    calc_df["說明"] = calc_df.apply(judge_position, axis=1)
+    calc_df["型態說明"] = calc_df.apply(judge_position, axis=1)
 
-    # 推算明日
+    # (9) 預估明日三關價與總結
     latest_row = calc_df.iloc[-1]
     curr_high = latest_row["High"]
     curr_low = latest_row["Low"]
@@ -216,9 +342,15 @@ def compute_three_passes_df(df: pd.DataFrame, days: int = 30):
         "next_down": curr_low - (curr_diff * 0.382),
         "curr_week_key": latest_row["周關鍵價"],
         "curr_month_key": latest_row["月關鍵價"],
-        "today_note": latest_row["說明"],
+        "today_note": latest_row["型態說明"],
+        "today_signal": latest_row["波段訊號"],
+        "today_position": latest_row["持倉狀態"],
+        "today_hold_days": latest_row["持倉天數"],
+        "today_defense": latest_row["動態防守價"],
+        "trend_env": latest_row["趨勢環境"],
     }
 
+    # 欄位整理
     calc_df.rename(
         columns={
             "Open": "開盤",
@@ -229,31 +361,33 @@ def compute_three_passes_df(df: pd.DataFrame, days: int = 30):
         inplace=True,
     )
 
-    cols = [
+    display_cols = [
         "開盤",
         "最高",
         "最低",
         "收盤",
-        "昨收",
-        "漲跌",
         "漲跌幅(%)",
-        "振幅(%)",
+        "趨勢環境",
+        "波段訊號",
+        "持倉狀態",
+        "持倉天數",
+        "動態防守價",
         "上關(空方防守)",
         "中關(日關)",
         "下關(多方防守)",
         "周關鍵價",
         "月關鍵價",
-        "說明",
+        "型態說明",
     ]
 
-    result = calc_df[cols].tail(days).sort_index(ascending=False)
+    result = calc_df[display_cols].tail(days).sort_index(ascending=False)
     result.index = result.index.strftime("%Y-%m-%d")
     result.index.name = "日期"
 
     return result, next_day_passes
 
 
-# --- 取得查詢標的資料 ---
+# --- 取得標的資料封裝 ---
 @st.cache_data(ttl=300)
 def get_target_data(user_input: str, days: int = 30):
     query = user_input.strip().upper()
@@ -297,7 +431,7 @@ def get_target_data(user_input: str, days: int = 30):
                 else f"個股 {clean_id}"
             )
 
-        result, next_day_passes = compute_three_passes_df(df, days=days)
+        result, next_day_passes = compute_three_passes_strategy(df, days=days)
         return result, next_day_passes, target_name, None
     except Exception as e:
         return None, None, None, f"查詢失敗：{str(e)}"
@@ -307,16 +441,16 @@ def get_target_data(user_input: str, days: int = 30):
 @st.cache_data(ttl=300)
 def get_market_overview():
     items = [
-        ("加權指數 (大盤)", lambda: fetch_stock_or_index("TAIEX", days=20)),
-        ("櫃買指數 (TPEx)", lambda: fetch_stock_or_index("TPEx", days=20)),
-        ("台指期 (近月)", lambda: fetch_tx_futures(days=20)),
-        ("費城半導體 (SOX)", lambda: fetch_sox_index(days=20)),
+        ("加權指數 (大盤)", lambda: fetch_stock_or_index("TAIEX", days=30)),
+        ("櫃買指數 (TPEx)", lambda: fetch_stock_or_index("TPEx", days=30)),
+        ("台指期 (近月)", lambda: fetch_tx_futures(days=30)),
+        ("費城半導體 (SOX)", lambda: fetch_sox_index(days=30)),
     ]
     overview_list = []
     for name, fetch_func in items:
         try:
             df = fetch_func()
-            _, next_info = compute_three_passes_df(df, days=5)
+            _, next_info = compute_three_passes_strategy(df, days=5)
             overview_list.append((name, next_info, None))
         except Exception as e:
             overview_list.append((name, None, str(e)))
@@ -333,25 +467,25 @@ def color_change(val):
     return ""
 
 
-def color_description(val):
+def color_signal(val):
     if not isinstance(val, str):
         return ""
-    if "漲破" in val or "強勢" in val:
-        return "color: #d32f2f; font-weight: bold;"
-    elif "偏多" in val:
-        return "color: #e65100; font-weight: 500;"
-    elif "偏空" in val:
-        return "color: #2e7d32; font-weight: 500;"
-    elif "跌破" in val or "弱勢" in val:
-        return "color: #1b5e20; font-weight: bold;"
+    if "多單進場" in val or "多單加碼" in val:
+        return "background-color: rgba(255, 75, 75, 0.25); color: #ff5252; font-weight: bold;"
+    elif "空單進場" in val or "空單加碼" in val:
+        return "background-color: rgba(9, 171, 59, 0.25); color: #69f0ae; font-weight: bold;"
+    elif "清倉" in val:
+        return "background-color: rgba(255, 235, 59, 0.2); color: #ffee58; font-weight: bold;"
+    elif "減碼" in val:
+        return "color: #ffa726; font-weight: bold;"
     return ""
 
 
 # ================= 網頁畫面呈現 =================
-st.title("三關價分析看板")
+st.title("三關價波段交易決策系統")
 
-# --- 1. 頂部常駐：市場核心指數直觀看板 ---
-st.markdown("### 🌐 市場核心指數・即時位階與關鍵價看板")
+# --- 1. 頂部常駐：市場核心四大指數看板 ---
+st.markdown("### 🌐 市場核心指數・即時位階與波段訊號看板")
 overview_data = get_market_overview()
 
 cols_top = st.columns(4)
@@ -360,33 +494,34 @@ for idx, (market_name, info, err) in enumerate(overview_data):
         if info:
             st.markdown(
                 f"<div style='border: 1px solid #333; border-radius: 8px; padding: 12px; background-color: rgba(255,255,255,0.03);'>"
-                f"<h4 style='margin:0; font-size:16px;'>{market_name}</h4>"
-                f"<p style='color: gray; font-size: 12px; margin: 2px 0 8px 0;'>收盤日期：{info['latest_date']}</p>"
-                f"<div style='font-size: 20px; font-weight: bold;'>{info['latest_close']:.2f} "
-                f"<span style='font-size: 13px; color: {'#ff4b4b' if info['latest_change'] > 0 else '#09ab3b'};'>"
-                f"{info['latest_change']:+.2f} ({info['latest_pct']:+.2f}%)</span></div>"
-                f"<hr style='margin: 8px 0; border: none; border-top: 1px solid #444;'/>"
-                f"<div style='font-size: 13px; line-height: 1.6;'>"
-                f"<b>明日上關(空防)：</b> {info['next_up']:.2f}<br/>"
-                f"<b>明日中關(日關)：</b> {info['next_mid']:.2f}<br/>"
-                f"<b>明日下關(多防)：</b> {info['next_down']:.2f}<br/>"
-                f"<b>本周關鍵價：</b> {info['curr_week_key']:.2f}<br/>"
-                f"<b>本月關鍵價：</b> {info['curr_month_key']:.2f}<br/>"
+                f"<div style='display:flex; justify-content:space-between; align-items:center;'>"
+                f"<h4 style='margin:0; font-size:15px;'>{market_name}</h4>"
+                f"<span style='font-size:11px; padding:2px 6px; border-radius:4px; background-color:#222;'>{info['trend_env']}</span>"
                 f"</div>"
-                f"<div style='margin-top: 8px; padding: 4px; border-radius: 4px; text-align: center; font-size: 12px; font-weight: bold; "
-                f"background-color: {'rgba(211,47,47,0.2)' if '漲破' in info['today_note'] or '強勢' in info['today_note'] else 'rgba(230,81,0,0.2)' if '偏多' in info['today_note'] else 'rgba(46,125,50,0.2)' if '偏空' in info['today_note'] else 'rgba(27,94,32,0.2)'}; "
-                f"color: {'#ff5252' if '漲破' in info['today_note'] or '強勢' in info['today_note'] else '#ffa726' if '偏多' in info['today_note'] else '#66bb6a' if '偏空' in info['today_note'] else '#81c784'};'>"
-                f"{info['today_note']}</div>"
+                f"<p style='color: gray; font-size: 11px; margin: 2px 0 6px 0;'>日期：{info['latest_date']}</p>"
+                f"<div style='font-size: 18px; font-weight: bold;'>{info['latest_close']:.2f} "
+                f"<span style='font-size: 12px; color: {'#ff4b4b' if info['latest_change'] > 0 else '#09ab3b'};'>"
+                f"{info['latest_change']:+.2f} ({info['latest_pct']:+.2f}%)</span></div>"
+                f"<hr style='margin: 6px 0; border: none; border-top: 1px solid #444;'/>"
+                f"<div style='font-size: 12px; line-height: 1.5;'>"
+                f"<b>明日上關：</b> {info['next_up']:.2f} | <b>中關：</b> {info['next_mid']:.2f}<br/>"
+                f"<b>明日下關：</b> {info['next_down']:.2f} | <b>月關鍵：</b> {info['curr_month_key']:.2f}<br/>"
+                f"<b>當前持倉：</b> {info['today_position']} ({info['today_hold_days']}天)<br/>"
+                f"</div>"
+                f"<div style='margin-top: 6px; padding: 3px; border-radius: 4px; text-align: center; font-size: 11px; font-weight: bold; "
+                f"background-color: {'rgba(211,47,47,0.2)' if '多單' in info['today_signal'] else 'rgba(46,125,50,0.2)' if '空單' in info['today_signal'] else 'rgba(100,100,100,0.2)'}; "
+                f"color: {'#ff5252' if '多單' in info['today_signal'] else '#81c784' if '空單' in info['today_signal'] else '#bbb'};'>"
+                f"訊號：{info['today_signal']}</div>"
                 f"</div>",
                 unsafe_allow_html=True,
             )
         else:
-            st.error(f"{market_name} 資料載入失敗")
+            st.error(f"{market_name} 載入失敗")
 
 st.markdown("---")
 
-# --- 2. 下方個別深度查詢 ---
-st.subheader("🔍 個股與指數個別深度查詢")
+# --- 2. 下方個別深度查詢與決策面板 ---
+st.subheader("🔍 個股/指數波段決策與防守分析")
 st.caption(
     "支援輸入：個股代號 (如: 2330)、大盤、櫃買、台指期、費半 (SOX)"
 )
@@ -400,11 +535,11 @@ with col1:
     )
 with col2:
     days_to_show = st.number_input(
-        "顯示天數", min_value=5, max_value=60, value=30
+        "顯示歷史天數", min_value=10, max_value=90, value=30
     )
 
 if user_input:
-    with st.spinner("資料載入中..."):
+    with st.spinner("策略模組計算中..."):
         df_result, next_info, target_name, err = get_target_data(
             user_input, days=days_to_show
         )
@@ -413,75 +548,74 @@ if user_input:
         st.error(err)
     else:
         st.markdown(
-            f"### 📊 【{target_name}】最新收盤 ({next_info['latest_date']}) 與 關鍵位階"
+            f"### 🎯 【{target_name}】波段狀態與明日戰略部署"
         )
 
-        # 6 格 KPI 指標：收盤、明日上關、中關、下關、周關鍵價、月關鍵價
+        # 頂部六大決策指標
         k1, k2, k3, k4, k5, k6 = st.columns(6)
         k1.metric(
             f"最新收盤 ({next_info['latest_date']})",
             f"{next_info['latest_close']:.2f}",
             f"{next_info['latest_change']:+.2f} ({next_info['latest_pct']:+.2f}%)",
         )
-        k2.metric(
-            "預計明日 上關",
-            f"{next_info['next_up']:.2f}",
-            help="明日空方防守價位",
-        )
+        k2.metric("趨勢大環境", next_info["trend_env"])
         k3.metric(
-            "預計明日 中關",
-            f"{next_info['next_mid']:.2f}",
-            help="明日多空強弱分水嶺",
+            "目前持倉水位",
+            f"{next_info['today_position']}",
+            f"持有 {next_info['today_hold_days']} 天",
         )
-        k4.metric(
-            "預計明日 下關",
-            f"{next_info['next_down']:.2f}",
-            help="明日多方防守價位",
+        defense_str = (
+            f"{next_info['today_defense']:.2f}"
+            if pd.notna(next_info["today_defense"])
+            else "無 (空倉)"
         )
+        k4.metric("當前動態防守點", defense_str, help="跌破多單清倉 / 漲破空單清倉")
         k5.metric(
-            "本周關鍵價",
-            f"{next_info['curr_week_key']:.2f}",
-            help="當周高低點中心價",
+            "預計明日 上關 (空防)",
+            f"{next_info['next_up']:.2f}",
+            help="空方主要防守防線",
         )
         k6.metric(
-            "本月關鍵價",
-            f"{next_info['curr_month_key']:.2f}",
-            help="當月高低點中心價",
+            "預計明日 下關 (多防)",
+            f"{next_info['next_down']:.2f}",
+            help="多方主要防守防線",
         )
 
-        # 狀態醒目標註卡片
-        note_text = next_info["today_note"]
-        if "強勢" in note_text or "漲破" in note_text:
-            st.error(f"🔥 **最新交易日型態結算：{note_text}**")
-        elif "偏多" in note_text:
-            st.warning(f"📈 **最新交易日型態結算：{note_text}**")
-        elif "偏空" in note_text:
-            st.info(f"📉 **最新交易日型態結算：{note_text}**")
-        else:
-            st.success(f"⚠️ **最新交易日型態結算：{note_text}**")
+        # 訊號與策略提示卡
+        sig_color = (
+            "error"
+            if "多單" in next_info["today_signal"]
+            else (
+                "success"
+                if "空單" in next_info["today_signal"]
+                else "info"
+            )
+        )
+        getattr(st, sig_color)(
+            f"🔔 **最新波段訊號：【{next_info['today_signal']}】** ｜ 當日型態：{next_info['today_note']} ｜ 本周關鍵價：{next_info['curr_week_key']:.2f} ｜ 本月關鍵價：{next_info['curr_month_key']:.2f}"
+        )
 
-        st.write("#### 詳細交易歷史清單")
+        # 詳細歷史決策與三關價報表
+        st.write("#### 📋 交易訊號與關鍵價歷史記錄清單")
+
+        format_dict = {
+            "開盤": "{:.2f}",
+            "最高": "{:.2f}",
+            "最低": "{:.2f}",
+            "收盤": "{:.2f}",
+            "漲跌幅(%)": "{:+.2f}%",
+            "動態防守價": lambda x: f"{x:.2f}" if pd.notna(x) else "-",
+            "上關(空方防守)": "{:.2f}",
+            "中關(日關)": "{:.2f}",
+            "下關(多方防守)": "{:.2f}",
+            "周關鍵價": "{:.2f}",
+            "月關鍵價": "{:.2f}",
+        }
 
         styled_df = (
-            df_result.style.format(
-                {
-                    "開盤": "{:.2f}",
-                    "最高": "{:.2f}",
-                    "最低": "{:.2f}",
-                    "收盤": "{:.2f}",
-                    "昨收": "{:.2f}",
-                    "漲跌": "{:+.2f}",
-                    "漲跌幅(%)": "{:+.2f}%",
-                    "振幅(%)": "{:.2f}%",
-                    "上關(空方防守)": "{:.2f}",
-                    "中關(日關)": "{:.2f}",
-                    "下關(多方防守)": "{:.2f}",
-                    "周關鍵價": "{:.2f}",
-                    "月關鍵價": "{:.2f}",
-                }
-            )
-            .map(color_change, subset=["漲跌", "漲跌幅(%)"])
-            .map(color_description, subset=["說明"])
+            df_result.style.format(format_dict)
+            .map(color_change, subset=["漲跌幅(%)"])
+            .map(color_signal, subset=["波段訊號"])
         )
 
-        st.dataframe(styled_df, use_container_width=True, height=500)
+        st.dataframe(styled_df, use_container_width=True, height=520)
