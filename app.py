@@ -167,7 +167,7 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
         (calc_df["High"] - calc_df["Low"]) / calc_df["昨收"]
     ) * 100
 
-    # 2. 三關價與簡稱 (空防 / AC / 多防)
+    # 2. 三關價 (空防 / AC / 多防)
     prev_high = calc_df["High"].shift(1)
     prev_low = calc_df["Low"].shift(1)
     diff = prev_high - prev_low
@@ -187,21 +187,21 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
     month_low = calc_df.groupby("Year_Month")["Low"].cummin()
     calc_df["月關"] = (month_high + month_low) / 2
 
-    # 4. 趨勢大環境判斷
+    # 4. 趨勢大環境判斷 (台股慣例：多頭紅色 🔴、空頭綠色 🟢)
     def get_trend_env(row):
         c, w, m = row["Close"], row["周關"], row["月關"]
         if pd.isna(w) or pd.isna(m):
             return "分析中"
         if c >= w and c >= m:
-            return "多頭 🟢"
+            return "多頭 🔴"
         elif c <= w and c <= m:
-            return "空頭 🔴"
+            return "空頭 🟢"
         else:
             return "震盪 🟡"
 
     calc_df["趨勢環境"] = calc_df.apply(get_trend_env, axis=1)
 
-    # 5. 型態說明 (日三關位階)
+    # 5. 型態說明
     def judge_position(row):
         close = row["Close"]
         up = row["空防"]
@@ -385,7 +385,6 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
         inplace=True,
     )
 
-    # 緊湊乾淨的欄位順序
     display_cols = [
         "開盤",
         "最高",
@@ -580,8 +579,8 @@ col1, col2 = st.columns([3, 1])
 with col1:
     user_input = st.text_input(
         "請輸入股號或標的名稱",
-        value="2330",
-        help="可輸入：2330、大盤、櫃買、台指期、費半...",
+        value="2301",
+        help="可輸入：2301、2330、大盤、櫃買、台指期、費半...",
     )
 with col2:
     days_to_show = st.number_input(
@@ -635,7 +634,7 @@ if user_input:
             help="多方主要防守防線",
         )
 
-        # 訊號狀態提示
+        # 訊號狀態提示卡
         sig_color = (
             "error"
             if "多單" in next_info["today_signal"]
