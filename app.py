@@ -187,7 +187,7 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
     month_low = calc_df.groupby("Year_Month")["Low"].cummin()
     calc_df["月關"] = (month_high + month_low) / 2
 
-    # (4) 趨勢大環境判斷 (台股慣例：多頭紅色 🔴 / 空頭綠色 🟢 / 震盪黃色 🟡)
+    # (4) 趨勢大環境判斷 (多頭紅標 🔴 / 空頭綠標 🟢 / 震盪黃標 🟡)
     def get_trend_env(row):
         c, w, m = row["Close"], row["周關"], row["月關"]
         if pd.isna(w) or pd.isna(m):
@@ -527,7 +527,7 @@ def color_signal(val):
     elif "空單進場" in val or "空單加碼" in val:
         return "background-color: rgba(9, 171, 59, 0.25); color: #69f0ae; font-weight: bold;"
     elif "清倉" in val:
-        return "background-color: rgba(255, 235, 59, 0.2); color: #ffee58; font-weight: bold;"
+        return "background-color: rgba(255, 235, 59, 0.3); color: #ffee58; font-weight: bold;"
     elif "減碼" in val:
         return "color: #ffa726; font-weight: bold;"
     return ""
@@ -550,7 +550,7 @@ def color_note(val):
 # ================= 網頁畫面呈現 =================
 st.title("三關價波段交易決策系統")
 
-# --- 1. 頂部常駐：市場四大核心看板 ---
+# --- 1. 頂部常駐：市場四大核心看板 (含周關、月關) ---
 st.markdown("### 🌐 市場核心指數・即時位階與波段訊號看板")
 overview_data = get_market_overview()
 
@@ -576,6 +576,35 @@ for idx, (market_name, info, err) in enumerate(overview_data):
                     else "#ffee58"
                 )
             )
+            
+            # 清倉訊號醒目黃色標示
+            sig_bg = (
+                "rgba(255, 235, 59, 0.25)"
+                if "清倉" in info["today_signal"]
+                else (
+                    "rgba(211,47,47,0.2)"
+                    if "多單" in info["today_signal"]
+                    else (
+                        "rgba(46,125,50,0.2)"
+                        if "空單" in info["today_signal"]
+                        else "rgba(100,100,100,0.2)"
+                    )
+                )
+            )
+            sig_color = (
+                "#ffee58"
+                if "清倉" in info["today_signal"]
+                else (
+                    "#ff5252"
+                    if "多單" in info["today_signal"]
+                    else (
+                        "#81c784"
+                        if "空單" in info["today_signal"]
+                        else "#bbb"
+                    )
+                )
+            )
+            
             st.markdown(
                 f"<div style='border: 1px solid #333; border-radius: 8px; padding: 12px; background-color: rgba(255,255,255,0.03);'>"
                 f"<div style='display:flex; justify-content:space-between; align-items:center;'>"
@@ -589,12 +618,11 @@ for idx, (market_name, info, err) in enumerate(overview_data):
                 f"<hr style='margin: 6px 0; border: none; border-top: 1px solid #444;'/>"
                 f"<div style='font-size: 12px; line-height: 1.5;'>"
                 f"<b>明日空防：</b> {info['next_up']:.2f} | <b>AC：</b> {info['next_mid']:.2f}<br/>"
-                f"<b>明日多防：</b> {info['next_down']:.2f} | <b>月關：</b> {info['curr_month_key']:.2f}<br/>"
-                f"<b>當前持倉：</b> {info['today_position']} ({info['today_hold_days']}天)<br/>"
+                f"<b>明日多防：</b> {info['next_down']:.2f} | <b>周關：</b> {info['curr_week_key']:.2f}<br/>"
+                f"<b>本月關鍵：</b> {info['curr_month_key']:.2f} | <b>持倉：</b> {info['today_position']} ({info['today_hold_days']}天)<br/>"
                 f"</div>"
                 f"<div style='margin-top: 6px; padding: 3px; border-radius: 4px; text-align: center; font-size: 11px; font-weight: bold; "
-                f"background-color: {'rgba(211,47,47,0.2)' if '多單' in info['today_signal'] else 'rgba(46,125,50,0.2)' if '空單' in info['today_signal'] else 'rgba(100,100,100,0.2)'}; "
-                f"color: {'#ff5252' if '多單' in info['today_signal'] else '#81c784' if '空單' in info['today_signal'] else '#bbb'};'>"
+                f"background-color: {sig_bg}; color: {sig_color};'>"
                 f"訊號：{info['today_signal']}</div>"
                 f"</div>",
                 unsafe_allow_html=True,
@@ -635,10 +663,26 @@ if user_input:
             f"### 🎯 【{target_name}】波段狀態與明日戰略部署"
         )
 
+        close_price = next_info["latest_close"]
+        up_val = next_info["next_up"]
+        mid_val = next_info["next_mid"]
+        down_val = next_info["next_down"]
+
+        # 計算與最新收盤價之差值與百分比
+        diff_up = up_val - close_price
+        pct_up = (diff_up / close_price) * 100
+
+        diff_mid = mid_val - close_price
+        pct_mid = (diff_mid / close_price) * 100
+
+        diff_down = down_val - close_price
+        pct_down = (diff_down / close_price) * 100
+
+        # 六大戰略部署 KPI 卡片 (依序：收盤 -> 趨勢 -> 持倉 -> 空防 -> AC -> 多防)
         k1, k2, k3, k4, k5, k6 = st.columns(6)
         k1.metric(
             f"最新收盤 ({next_info['latest_date']})",
-            f"{next_info['latest_close']:.2f}",
+            f"{close_price:.2f}",
             f"{next_info['latest_change']:+.2f} ({next_info['latest_pct']:+.2f}%)",
         )
         k2.metric("趨勢大環境", next_info["trend_env"])
@@ -651,36 +695,43 @@ if user_input:
             f"損益: {pnl_display} ({next_info['today_hold_days']}天)",
         )
 
-        defense_str = (
-            f"{next_info['today_defense']:.2f}"
-            if pd.notna(next_info["today_defense"])
-            else "無 (空倉)"
-        )
-        k4.metric("動態防守點", defense_str, help="跌破多單清倉 / 漲破空單清倉")
-        k5.metric(
+        k4.metric(
             "預計明日 空防 (上關)",
-            f"{next_info['next_up']:.2f}",
-            help="空方主要防守防線",
+            f"{up_val:.2f}",
+            f"距離: {diff_up:+.2f} ({pct_up:+.2f}%)",
+            help="空方主要防守線 (突破進多/空單清倉)",
+        )
+        k5.metric(
+            "預計明日 AC (中關)",
+            f"{mid_val:.2f}",
+            f"距離: {diff_mid:+.2f} ({pct_mid:+.2f}%)",
+            help="多空中心日關 (跌破/漲上觸發減碼 50%)",
         )
         k6.metric(
             "預計明日 多防 (下關)",
-            f"{next_info['next_down']:.2f}",
-            help="多方主要防守防線",
+            f"{down_val:.2f}",
+            f"距離: {diff_down:+.2f} ({pct_down:+.2f}%)",
+            help="多方主要防守線 (跌破進空/多單清倉)",
         )
 
-        # 訊號狀態提示
-        sig_color = (
-            "error"
-            if "多單" in next_info["today_signal"]
-            else (
-                "success"
-                if "空單" in next_info["today_signal"]
-                else "info"
+        # 訊號狀態提示 (清倉使用 warning 黃色卡片)
+        sig_type = next_info["today_signal"]
+        if "清倉" in sig_type:
+            st.warning(
+                f"🚨 **波段警示：【{sig_type}】** ｜ 型態：{next_info['today_note']} ｜ 周關：{next_info['curr_week_key']:.2f} ｜ 月關：{next_info['curr_month_key']:.2f}"
             )
-        )
-        getattr(st, sig_color)(
-            f"🔔 **波段訊號：【{next_info['today_signal']}】** ｜ 型態：{next_info['today_note']} ｜ AC：{next_info['next_mid']:.2f} ｜ 周關：{next_info['curr_week_key']:.2f} ｜ 月關：{next_info['curr_month_key']:.2f}"
-        )
+        elif "多單" in sig_type:
+            st.error(
+                f"🔥 **波段訊號：【{sig_type}】** ｜ 型態：{next_info['today_note']} ｜ 周關：{next_info['curr_week_key']:.2f} ｜ 月關：{next_info['curr_month_key']:.2f}"
+            )
+        elif "空單" in sig_type:
+            st.success(
+                f"❄️ **波段訊號：【{sig_type}】** ｜ 型態：{next_info['today_note']} ｜ 周關：{next_info['curr_week_key']:.2f} ｜ 月關：{next_info['curr_month_key']:.2f}"
+            )
+        else:
+            st.info(
+                f"🔔 **波段狀態：【{sig_type}】** ｜ 型態：{next_info['today_note']} ｜ 周關：{next_info['curr_week_key']:.2f} ｜ 月關：{next_info['curr_month_key']:.2f}"
+            )
 
         st.write("#### 📋 交易訊號與關鍵價歷史記錄清單")
 
