@@ -152,7 +152,7 @@ def fetch_sox_index(days: int = 120) -> pd.DataFrame:
     raise ValueError("費城半導體指數資料取得失敗。")
 
 
-# --- 5. 波段策略核心引擎 (含防雙巴濾網與狀態機) ---
+# --- 5. 波段策略核心引擎 ---
 def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
     if df.empty or len(df) < 25:
         return None, None
@@ -187,7 +187,7 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
     month_low = calc_df.groupby("Year_Month")["Low"].cummin()
     calc_df["月關"] = (month_high + month_low) / 2
 
-    # (4) 趨勢大環境判斷 (多頭紅標 🔴 / 空頭綠標 🟢 / 震盪黃標 🟡)
+    # (4) 趨勢大環境判斷
     def get_trend_env(row):
         c, w, m = row["Close"], row["周關"], row["月關"]
         if pd.isna(w) or pd.isna(m):
@@ -201,7 +201,7 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
 
     calc_df["趨勢環境"] = calc_df.apply(get_trend_env, axis=1)
 
-    # (5) 型態說明 (當日三關位階)
+    # (5) 型態說明
     def judge_position(row):
         close = row["Close"]
         up = row["空防"]
@@ -262,7 +262,6 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
 
         # 狀態切換邏輯
         if curr_pos == "NONE":
-            # 多頭環境 + 實質突破 + 非冷卻期
             if c > (up * 1.002) and "多頭" in trend and cooldown_counter == 0:
                 curr_pos = "LONG_100"
                 days_in_trade = 1
@@ -270,7 +269,6 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
                 recorded_entry = active_entry_price
                 calculated_pnl = 0.0
                 sig = "🔥 多單進場"
-            # 空頭環境 + 實質跌破 + 非冷卻期
             elif c < (dn * 0.998) and "空頭" in trend and cooldown_counter == 0:
                 curr_pos = "SHORT_100"
                 days_in_trade = 1
@@ -289,26 +287,40 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
 
             if c < dn:
                 recorded_exit = c
-                calculated_pnl = ((recorded_exit - active_entry_price) / active_entry_price) * 100
+                calculated_pnl = (
+                    (recorded_exit - active_entry_price) / active_entry_price
+                ) * 100
                 curr_pos = "NONE"
                 sig = "🚨 多單清倉"
                 days_in_trade = 0
                 active_entry_price = np.nan
                 cooldown_counter = 2
-            elif days_in_trade >= 5 and c < active_entry_price and curr_pos == "LONG_100":
+            elif (
+                days_in_trade >= 5
+                and c < active_entry_price
+                and curr_pos == "LONG_100"
+            ):
                 curr_pos = "LONG_50"
-                calculated_pnl = ((c - active_entry_price) / active_entry_price) * 100
+                calculated_pnl = (
+                    (c - active_entry_price) / active_entry_price
+                ) * 100
                 sig = "⏱️ 時間減碼50%"
             elif c < mid and curr_pos == "LONG_100":
                 curr_pos = "LONG_50"
-                calculated_pnl = ((c - active_entry_price) / active_entry_price) * 100
+                calculated_pnl = (
+                    (c - active_entry_price) / active_entry_price
+                ) * 100
                 sig = "⚠️ 多單減碼50%"
             elif c > up and curr_pos == "LONG_50":
                 curr_pos = "LONG_100"
-                calculated_pnl = ((c - active_entry_price) / active_entry_price) * 100
+                calculated_pnl = (
+                    (c - active_entry_price) / active_entry_price
+                ) * 100
                 sig = "➕ 多單加碼"
             else:
-                calculated_pnl = ((c - active_entry_price) / active_entry_price) * 100
+                calculated_pnl = (
+                    (c - active_entry_price) / active_entry_price
+                ) * 100
                 sig = "多單續抱"
 
         elif "SHORT" in curr_pos:
@@ -317,26 +329,40 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
 
             if c > up:
                 recorded_exit = c
-                calculated_pnl = ((active_entry_price - recorded_exit) / active_entry_price) * 100
+                calculated_pnl = (
+                    (active_entry_price - recorded_exit) / active_entry_price
+                ) * 100
                 curr_pos = "NONE"
                 sig = "🚨 空單清倉"
                 days_in_trade = 0
                 active_entry_price = np.nan
                 cooldown_counter = 2
-            elif days_in_trade >= 5 and c > active_entry_price and curr_pos == "SHORT_100":
+            elif (
+                days_in_trade >= 5
+                and c > active_entry_price
+                and curr_pos == "SHORT_100"
+            ):
                 curr_pos = "SHORT_50"
-                calculated_pnl = ((active_entry_price - c) / active_entry_price) * 100
+                calculated_pnl = (
+                    (active_entry_price - c) / active_entry_price
+                ) * 100
                 sig = "⏱️ 時間減碼50%"
             elif c > mid and curr_pos == "SHORT_100":
                 curr_pos = "SHORT_50"
-                calculated_pnl = ((active_entry_price - c) / active_entry_price) * 100
+                calculated_pnl = (
+                    (active_entry_price - c) / active_entry_price
+                ) * 100
                 sig = "⚠️ 空單減碼50%"
             elif c < dn and curr_pos == "SHORT_50":
                 curr_pos = "SHORT_100"
-                calculated_pnl = ((active_entry_price - c) / active_entry_price) * 100
+                calculated_pnl = (
+                    (active_entry_price - c) / active_entry_price
+                ) * 100
                 sig = "➕ 空單加碼"
             else:
-                calculated_pnl = ((active_entry_price - c) / active_entry_price) * 100
+                calculated_pnl = (
+                    (active_entry_price - c) / active_entry_price
+                ) * 100
                 sig = "空單續抱"
 
         pos_display = {
@@ -402,6 +428,7 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
         inplace=True,
     )
 
+    # 移除持倉狀態欄位，保留波段訊號與持倉天數
     display_cols = [
         "開盤",
         "最高",
@@ -410,7 +437,6 @@ def compute_three_passes_strategy(df: pd.DataFrame, days: int = 30):
         "漲跌幅(%)",
         "型態說明",
         "波段訊號",
-        "持倉狀態",
         "持倉天數",
         "進場價",
         "出場價",
@@ -550,7 +576,7 @@ def color_note(val):
 # ================= 網頁畫面呈現 =================
 st.title("三關價波段交易決策系統")
 
-# --- 1. 頂部常駐：市場四大核心看板 (含周關、月關) ---
+# --- 1. 頂部常駐：市場四大核心看板 ---
 st.markdown("### 🌐 市場核心指數・即時位階與波段訊號看板")
 overview_data = get_market_overview()
 
@@ -576,8 +602,7 @@ for idx, (market_name, info, err) in enumerate(overview_data):
                     else "#ffee58"
                 )
             )
-            
-            # 清倉訊號醒目黃色標示
+
             sig_bg = (
                 "rgba(255, 235, 59, 0.25)"
                 if "清倉" in info["today_signal"]
@@ -604,7 +629,7 @@ for idx, (market_name, info, err) in enumerate(overview_data):
                     )
                 )
             )
-            
+
             st.markdown(
                 f"<div style='border: 1px solid #333; border-radius: 8px; padding: 12px; background-color: rgba(255,255,255,0.03);'>"
                 f"<div style='display:flex; justify-content:space-between; align-items:center;'>"
@@ -616,10 +641,9 @@ for idx, (market_name, info, err) in enumerate(overview_data):
                 f"<span style='font-size: 12px; color: {'#ff4b4b' if info['latest_change'] > 0 else '#09ab3b'};'>"
                 f"{info['latest_change']:+.2f} ({info['latest_pct']:+.2f}%)</span></div>"
                 f"<hr style='margin: 6px 0; border: none; border-top: 1px solid #444;'/>"
-                f"<div style='font-size: 12px; line-height: 1.5;'>"
-                f"<b>明日空防：</b> {info['next_up']:.2f} | <b>AC：</b> {info['next_mid']:.2f}<br/>"
-                f"<b>明日多防：</b> {info['next_down']:.2f} | <b>周關：</b> {info['curr_week_key']:.2f}<br/>"
-                f"<b>本月關鍵：</b> {info['curr_month_key']:.2f} | <b>持倉：</b> {info['today_position']} ({info['today_hold_days']}天)<br/>"
+                f"<div style='font-size: 12px; line-height: 1.6;'>"
+                f"<b>明日空防：</b> {info['next_up']:.2f} | <b>AC：</b> {info['next_mid']:.2f} | <b>明日多防：</b> {info['next_down']:.2f}<br/>"
+                f"<b>周關：</b> {info['curr_week_key']:.2f} | <b>月關：</b> {info['curr_month_key']:.2f}<br/>"
                 f"</div>"
                 f"<div style='margin-top: 6px; padding: 3px; border-radius: 4px; text-align: center; font-size: 11px; font-weight: bold; "
                 f"background-color: {sig_bg}; color: {sig_color};'>"
@@ -668,7 +692,6 @@ if user_input:
         mid_val = next_info["next_mid"]
         down_val = next_info["next_down"]
 
-        # 計算與最新收盤價之差值與百分比
         diff_up = up_val - close_price
         pct_up = (diff_up / close_price) * 100
 
@@ -678,41 +701,103 @@ if user_input:
         diff_down = down_val - close_price
         pct_down = (diff_down / close_price) * 100
 
-        # 六大戰略部署 KPI 卡片 (依序：收盤 -> 趨勢 -> 持倉 -> 空防 -> AC -> 多防)
+        # 六大戰略部署 KPI 卡片 (客製化 HTML，確保台股紅漲綠跌箭頭正確)
+        def render_kpi(label, val_str, sub_val, is_diff=False, diff_num=0):
+            if is_diff:
+                if diff_num > 0:
+                    color = "#ff4b4b"  # 漲紅
+                    arrow = "↑"
+                elif diff_num < 0:
+                    color = "#09ab3b"  # 跌綠
+                    arrow = "↓"
+                else:
+                    color = "#888888"
+                    arrow = ""
+                sub_html = f"<div style='font-size:12px; color:{color}; font-weight:bold;'>{arrow} 距離: {sub_val}</div>"
+            else:
+                sub_html = f"<div style='font-size:12px; color:#aaa;'>{sub_val}</div>"
+
+            return (
+                f"<div style='border:1px solid #333; border-radius:6px; padding:10px; background:rgba(255,255,255,0.02);'>"
+                f"<div style='font-size:12px; color:#888; margin-bottom:4px;'>{label}</div>"
+                f"<div style='font-size:20px; font-weight:bold; margin-bottom:4px;'>{val_str}</div>"
+                f"{sub_html}"
+                f"</div>"
+            )
+
         k1, k2, k3, k4, k5, k6 = st.columns(6)
-        k1.metric(
-            f"最新收盤 ({next_info['latest_date']})",
-            f"{close_price:.2f}",
-            f"{next_info['latest_change']:+.2f} ({next_info['latest_pct']:+.2f}%)",
-        )
-        k2.metric("趨勢大環境", next_info["trend_env"])
 
-        pnl_val = next_info["today_pnl"]
-        pnl_display = f"{pnl_val:+.2f}%" if pd.notna(pnl_val) else "-"
-        k3.metric(
-            "目前持倉水位",
-            f"{next_info['today_position']}",
-            f"損益: {pnl_display} ({next_info['today_hold_days']}天)",
-        )
+        with k1:
+            chg = next_info["latest_change"]
+            pct = next_info["latest_pct"]
+            c_color = "#ff4b4b" if chg > 0 else ("#09ab3b" if chg < 0 else "#aaa")
+            c_arrow = "↑" if chg > 0 else ("↓" if chg < 0 else "")
+            sub = f"<span style='color:{c_color}; font-weight:bold;'>{c_arrow} {chg:+.2f} ({pct:+.2f}%)</span>"
+            st.markdown(
+                render_kpi(
+                    f"最新收盤 ({next_info['latest_date']})",
+                    f"{close_price:.2f}",
+                    sub,
+                ),
+                unsafe_allow_html=True,
+            )
 
-        k4.metric(
-            "預計明日 空防 (上關)",
-            f"{up_val:.2f}",
-            f"距離: {diff_up:+.2f} ({pct_up:+.2f}%)",
-            help="空方主要防守線 (突破進多/空單清倉)",
-        )
-        k5.metric(
-            "預計明日 AC (中關)",
-            f"{mid_val:.2f}",
-            f"距離: {diff_mid:+.2f} ({pct_mid:+.2f}%)",
-            help="多空中心日關 (跌破/漲上觸發減碼 50%)",
-        )
-        k6.metric(
-            "預計明日 多防 (下關)",
-            f"{down_val:.2f}",
-            f"距離: {diff_down:+.2f} ({pct_down:+.2f}%)",
-            help="多方主要防守線 (跌破進空/多單清倉)",
-        )
+        with k2:
+            st.markdown(
+                render_kpi("趨勢大環境", next_info["trend_env"], "多空整體位階"),
+                unsafe_allow_html=True,
+            )
+
+        with k3:
+            pnl_val = next_info["today_pnl"]
+            if pd.notna(pnl_val):
+                p_color = "#ff4b4b" if pnl_val > 0 else ("#09ab3b" if pnl_val < 0 else "#aaa")
+                p_arrow = "↑" if pnl_val > 0 else ("↓" if pnl_val < 0 else "")
+                p_sub = f"<span style='color:{p_color}; font-weight:bold;'>{p_arrow} 損益: {pnl_val:+.2f}%</span> ({next_info['today_hold_days']}天)"
+            else:
+                p_sub = "0.00% (0天)"
+            st.markdown(
+                render_kpi("目前持倉水位", next_info["today_position"], p_sub),
+                unsafe_allow_html=True,
+            )
+
+        with k4:
+            st.markdown(
+                render_kpi(
+                    "預計明日 空防 (上關)",
+                    f"{up_val:.2f}",
+                    f"{diff_up:+.2f} ({pct_up:+.2f}%)",
+                    is_diff=True,
+                    diff_num=diff_up,
+                ),
+                unsafe_allow_html=True,
+            )
+
+        with k5:
+            st.markdown(
+                render_kpi(
+                    "預計明日 AC (中關)",
+                    f"{mid_val:.2f}",
+                    f"{diff_mid:+.2f} ({pct_mid:+.2f}%)",
+                    is_diff=True,
+                    diff_num=diff_mid,
+                ),
+                unsafe_allow_html=True,
+            )
+
+        with k6:
+            st.markdown(
+                render_kpi(
+                    "預計明日 多防 (下關)",
+                    f"{down_val:.2f}",
+                    f"{diff_down:+.2f} ({pct_down:+.2f}%)",
+                    is_diff=True,
+                    diff_num=diff_down,
+                ),
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
 
         # 訊號狀態提示 (清倉使用 warning 黃色卡片)
         sig_type = next_info["today_signal"]
